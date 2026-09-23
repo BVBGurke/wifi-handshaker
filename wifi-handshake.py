@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Offline, passive Wi-Fi handshake capture. Run --help or --self-test first."""
+"""Offline, passive Wi-Fi handshake capture. Run --help or --self-test first.
+
+This module is the engine. Run `python tui.py` (or this file) for the TUI.
+Passive capture only: no deauthentication, injection or radio interference.
+Note: load it only from tui.py, not with submodules under the same package name.
+"""
 
 import argparse
 import base64
@@ -2086,11 +2091,17 @@ Client usage (Linux laptop):
 
 
 if __name__ == "__main__":
+    # The interactive front-end lives in tui.py. This script is the engine and
+    # library; running it directly opens the TUI so there is a single entry point.
     try:
-        sys.exit(main())
-    except (KeyboardInterrupt, EOFError):
-        print("\nCancelled. No incomplete capture saved.")
-        sys.exit(130)
-    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        import tui
+        sys.exit(tui.main())
+    except ImportError:
+        try:
+            sys.exit(main())
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled. No incomplete capture saved.")
+            sys.exit(130)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
