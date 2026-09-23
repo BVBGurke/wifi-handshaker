@@ -188,7 +188,9 @@ Menu item **3 – Send capture** always opens this list first: pick a device
 manual URL is only offered when **no host** was found. The chosen host is kept
 for the current session only. When Tailscale is not running the tool offers to
 log in instead of failing. `--discover-towers` lists only the actual hosts.
-Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
+If the configured default host (see `config.json`) is online but not serving
+the host service, both the list and the picker print the exact command to start
+it there. Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
 `--tower-name` and never prompt.
 
 `--serve` prints the tailnet IP the host is reachable at, e.g.
