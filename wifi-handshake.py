@@ -449,6 +449,17 @@ def tailscale_proxy():
         return None
 
 
+def _socks5_recv_exact(sock, size):
+    """Read exactly ``size`` bytes, raising OSError on a short/empty read."""
+    chunks = bytearray()
+    while len(chunks) < size:
+        data = sock.recv(size - len(chunks))
+        if not data:
+            raise OSError("SOCKS5 proxy closed the connection.")
+        chunks += data
+    return bytes(chunks)
+
+
 def _socks5_connect(proxy, host, port, timeout):
     """Connect ``host:port`` through a SOCKS5 proxy and return the socket."""
     proxy_host, proxy_port = proxy
@@ -456,23 +467,23 @@ def _socks5_connect(proxy, host, port, timeout):
     sock.settimeout(timeout)
     try:
         sock.sendall(b"\x05\x01\x00")  # SOCKS5, one method: no authentication
-        if sock.recv(2) != b"\x05\x00":
+        if _socks5_recv_exact(sock, 2) != b"\x05\x00":
             raise OSError("SOCKS5 proxy rejected no-auth.")
         if ":" in host:
             address = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
         else:
             address = b"\x01" + socket.inet_aton(host)
         sock.sendall(b"\x05\x01\x00" + address + struct.pack(">H", port))
-        header = sock.recv(4)
-        if len(header) != 4 or header[1] != 0:
+        header = _socks5_recv_exact(sock, 4)
+        if header[1] != 0:
             raise OSError("SOCKS5 connect failed.")
         if header[3] == 1:
-            sock.recv(6)
+            _socks5_recv_exact(sock, 6)
         elif header[3] == 4:
-            sock.recv(18)
+            _socks5_recv_exact(sock, 18)
         else:
-            size = sock.recv(1)[0]
-            sock.recv(size + 2)
+            size = _socks5_recv_exact(sock, 1)[0]
+            _socks5_recv_exact(sock, size + 2)
         return sock
     except BaseException:
         sock.close()
@@ -621,6 +632,23 @@ def print_tailnet_devices(devices):
     info("* marks this device.")
 
 
+def warn_host_unavailable(devices, port=DEFAULT_PORT):
+    """Warn when the configured default host is online but not serving the host service.
+
+    The device may simply not run ``--serve`` right now, or another service may
+    occupy the port — give the user a concrete hint instead of a bare list.
+    """
+    name = load_config().get("tower_name")
+    if not name:
+        return
+    want = name.rstrip(".").lower()
+    hits = [d for d in devices if d["hostname"].lower() == want]
+    if hits and not any(d.get("tower") for d in hits):
+        warn(f"Configured host '{name}' is online but does not answer on the host "
+             f"service (port {port}). Start it there with: python wifi-handshake.py "
+             f"--serve --port {port}")
+
+
 def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
     """Return only the tailnet devices that run a tower."""
     return [device for device in scan_tailnet_devices(port, status, timeout)
@@ -652,6 +680,7 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
             tailscale_login()
         return None
     devices = scan_tailnet_devices(port, status, timeout)
+    warn_host_unavailable(devices, port)
     query = None
     while True:
         heading("Devices in the tailnet")
@@ -3623,7 +3652,9 @@ def main(argv=None):
             if not tailscale_ready():
                 warn("Tailscale is not running. Start it with `sudo tailscale up`.")
                 return 1
-            print_tailnet_devices(scan_tailnet_devices(args.port, timeout=TOWER_PROBE_TIMEOUT))
+            devices = scan_tailnet_devices(args.port, timeout=TOWER_PROBE_TIMEOUT)
+            print_tailnet_devices(devices)
+            warn_host_unavailable(devices, args.port)
             return 0
         headless = run_headless(args)
         if headless is not None:
