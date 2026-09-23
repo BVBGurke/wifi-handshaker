@@ -1,8 +1,8 @@
 # wifi-handshake
 
 Passive WPA handshake capture on a Linux laptop and GPU cracking on a
-Windows tower. The laptop grabs the handshake and sends it over Tailscale to
-the tower; the tower cracks it with `hashcat` on the GPU and sends the result
+Windows host. The laptop grabs the handshake and sends it over Tailscale to
+the host; the host cracks it with `hashcat` on the GPU and sends the result
 back. Everything is driven from an interactive terminal menu or classically
 from a shell (`--run-capture`).
 
@@ -14,7 +14,7 @@ from a shell (`--run-capture`).
 ## 1. Overview
 
 ```
-   Laptop (Linux, Arch)                     Tower (Windows + GPU)
+   Laptop (Linux, Arch)                     Host (Windows + GPU)
    ┌───────────────────────┐   Tailscale   ┌──────────────────────────┐
    │ WLAN card monitor     │   + TLS/WS    │ HTTP/JSON + WebSocket    │
    │ → Handshake (.pcapng) │ ────────────► │ hcxpcapngtool → .hc22000 │
@@ -31,7 +31,7 @@ from a shell (`--run-capture`).
 * **No app-level authentication**: the tailnet is the trust boundary. Anyone
   in the tailnet may start jobs. Restrict it with Tailscale ACLs if needed.
 * **One file for everything**: `wifi-handshake.py` contains the engine and the
-  terminal menu. The mode (capture / tower / client) is chosen in the menu.
+  terminal menu. The mode (capture / host / client) is chosen in the menu.
 
 ---
 
@@ -56,19 +56,19 @@ from a shell (`--run-capture`).
   ```
   sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
   ```
-* Tailscale installed and in the same tailnet as the tower.
+* Tailscale installed and in the same tailnet as the host.
 
-### Tower (Windows)
+### Host (Windows)
 * GPU: NVIDIA (CUDA) or AMD (OpenCL/HIP) — backend is auto-selected.
 * `hashcat` as a project copy under `tools\hashcat-7.1.2\`.
 * `hcxpcapngtool.exe` **optional** (see note below).
 * Tailscale installed and in the same tailnet as the laptop.
 
 ### Network
-* Both devices in the same tailnet. Discovery matches the tower by its tailnet
+* Both devices in the same tailnet. Discovery matches the host by its tailnet
   hostname and connects to its tailnet **IP** (`100.x.y.z`), so MagicDNS is not
   required.
-* The tower does not need to be publicly reachable — Tailscale handles NAT traversal.
+* The host does not need to be publicly reachable — Tailscale handles NAT traversal.
 * Join the tailnet on each device with `sudo tailscale up`, or from the tool with
   `python wifi-handshake.py --tailscale-login` (menu item **7 – Tailscale**).
   `--tailscale-status` shows the peers and their tailnet IPs.
@@ -77,7 +77,7 @@ from a shell (`--run-capture`).
 
 ## 3. Installation
 
-### Tower: GPU toolchain
+### Host: GPU toolchain
 ```
 python wifi-handshake.py --install-tools
 ```
@@ -87,8 +87,8 @@ checksum and unpacks it into `tools\`. Alternatively use menu item
 
 > **Important:** There is **no official Windows binary** for `hcxtools`
 > (ZerBea only publishes source). That is why by default the **Linux laptop**
-> does the conversion (there `hcxtools` is a package). The tower only converts
-> if `hcxpcapngtool` is actually present. Without it the tower cannot process
+> does the conversion (there `hcxtools` is a package). The host only converts
+> if `hcxpcapngtool` is actually present. Without it the host cannot process
 > raw `.pcapng` files — send it `.hc22000` instead (the client does this
 > automatically).
 
@@ -110,19 +110,19 @@ Without arguments `wifi-handshake.py` starts an interactive terminal menu:
 ```
 wifi-handshake - Terminal Menu
   1. Capture handshake  (Linux, monitor mode, root)
-  2. Start tower        (server + hashcat, for the GPU box)
+  2. Start host         (server + hashcat, for the GPU box)
   3. Send capture       (client: list tailnet devices, then upload)
   4. Help / Install     (--help, download hashcat)
   5. Inspect capture    (offline: find/verify a handshake in a file)
   6. Example captures   (download public test data)
-  7. Tailscale          (status, log in, pick the tower in your tailnet)
-  8. Devices            (list reachable tailnet devices, pick the tower)
+  7. Tailscale          (status, log in, pick the host in your tailnet)
+  8. Devices            (list reachable tailnet devices, pick the host)
   q  Quit
 ```
 
 The menu stays open after each action. After a successful capture it asks
-whether to send the file to the tower right away (menu item 1 → capture →
-"Send this capture to a tower now? [y/N]"). When run without root, the
+whether to send the file to the host right away (menu item 1 → capture →
+"Send this capture to a host now? [y/N]"). When run without root, the
 `sudo` password is asked **once** at the start of the capture and kept alive
 in the background, so long captures never prompt again; the capture itself runs
 as a child process, so the menu survives.
@@ -132,7 +132,7 @@ at the top of `wifi-handshake.py`).
 
 Run modes without the menu:
 
-**Tower (Windows/GPU):**
+**Host (Windows/GPU):**
 ```
 python wifi-handshake.py --serve --port 8443
 ```
@@ -150,9 +150,9 @@ Options:
 `--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
 `--discover-towers`, `--list-devices`.
 
-### Tailscale (tower discovery)
+### Tailscale (host discovery)
 
-The tower does not need a public address: put both machines in the same
+The host does not need a public address: put both machines in the same
 **tailnet** and let Tailscale handle NAT traversal. The tool wraps the
 `tailscale` CLI so you rarely have to type a URL:
 
@@ -160,37 +160,38 @@ The tower does not need a public address: put both machines in the same
 python wifi-handshake.py --tailscale-status   # show this node and all peers
 python wifi-handshake.py --tailscale-login    # join the tailnet (`tailscale up`)
 python wifi-handshake.py --list-devices       # list reachable tailnet devices
-python wifi-handshake.py --discover-towers    # only peers that run a tower
-python wifi-handshake.py --send capture.pcapng --tower-name tower
+python wifi-handshake.py --discover-towers    # only peers that run a host
+python wifi-handshake.py --send capture.pcapng --tower-name NAME
 ```
 
 `--tailscale-status` prints the login state, this device's tailnet IP and a
 numbered list of peers. `--tower-name NAME` looks that peer up by its hostname
-and builds the tower URL from its **tailnet IP**, e.g.
-`https://100.x.y.z:<port>` (the default name when discovering is `tower`).
+and builds the host URL from its **tailnet IP**, e.g.
+`https://100.x.y.z:<port>` (defaults to the `tower_name` setting in
+`~/.wifi-handshake/config.json`, or `tower`).
 
 **Device list:** `--list-devices` and menu item **8 – Devices** list **every
 reachable device** in the tailnet — hostname, IP, ping latency, and (for
-towers) GPU backend and hashcat version. This device is marked with `*`, real
-towers are detected via the **health handshake** (`/api/v1/health`, HTTPS first,
+hosts) GPU backend and hashcat version. This device is marked with `*`, real
+hosts are detected via the **health handshake** (`/api/v1/health`, HTTPS first,
 then HTTP). The device picker supports filtering by typing a name/IP:
 
 ```
   #  Host                     IP              Ping  Backend   Hashcat
   1  JannisTower              100.105.183.20  12 ms  CUDA      v7.1.2
-  2  moonlight-debian         100.108.170.86   5 ms  (no tower) -
-  3  laptop *                 100.122.97.87    -    (no tower) -
+  2  moonlight-debian         100.108.170.86   5 ms  (no host) -
+  3  laptop *                 100.122.97.87    -    (no host) -
 ```
 
 Menu item **3 – Send capture** always opens this list first: pick a device
 (number), confirm, and the capture is uploaded. `r` rescans, `q` cancels, and a
-manual URL is only offered when **no tower** was found. The chosen tower is kept
+manual URL is only offered when **no host** was found. The chosen host is kept
 for the current session only. When Tailscale is not running the tool offers to
-log in instead of failing. `--discover-towers` lists only the actual towers.
+log in instead of failing. `--discover-towers` lists only the actual hosts.
 Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
 `--tower-name` and never prompt.
 
-`--serve` prints the tailnet IP the tower is reachable at, e.g.
+`--serve` prints the tailnet IP the host is reachable at, e.g.
 `use: --tower https://100.x.y.z:8443`.
 
 If Tailscale is not installed or the daemon is not running the helpers only warn
@@ -202,10 +203,41 @@ WIFI_HANDSHAKE_TAILSCALE_SOCKET=/run/user/1000/tailscaled.sock \
   python wifi-handshake.py --tailscale-status
 ```
 
+### Configuration (`~/.wifi-handshake/config.json`)
+
+Optional settings that are read automatically on every run:
+
+| Key | Meaning |
+|---|---|
+| `tailscale_socket` | socket path of a root-less `tailscaled` daemon |
+| `tower_name` | default tailnet hostname of the host (e.g. `jannistower`) |
+
+Example:
+
+```json
+{
+  "tailscale_socket": "/run/user/1000/tailscaled.sock",
+  "tower_name": "jannistower"
+}
+```
+
+To run Tailscale **permanently without root**, a systemd user unit
+(`~/.config/systemd/user/tailscaled.service`) starts a userspace daemon that
+survives logins/reboots and serves a SOCKS5 proxy (`127.0.0.1:1056`); the tool
+routes probes through it automatically:
+
+```
+systemctl --user enable --now tailscaled
+tailscale --socket=/run/user/1000/tailscaled.sock up
+```
+
+With a system-wide daemon (`sudo systemctl enable --now tailscaled && sudo
+tailscale up`) the tool connects to the tailnet IPs directly instead.
+
 ### Offline inspection and example captures
 
 A capture can be checked **without a radio or root** — useful before uploading it
-to the tower, and for testing the parser against known-good data:
+to the host, and for testing the parser against known-good data:
 
 ```
 python wifi-handshake.py --inspect capture.pcapng
@@ -227,13 +259,13 @@ The scan list also shows a **Cl** column (associated clients seen in the
 airodump CSV). APs with clients are the best passive targets: they rekey when
 their own devices reconnect, no deauthentication needed.
 
-### Step 1 – Start the tower (Windows)
-Via menu item **2 – Start tower** or directly:
+### Step 1 – Start the host (Windows)
+Via menu item **2 – Start host** or directly:
 ```
 python wifi-handshake.py --serve --port 8443
 ```
 ```
-tower tools: hashcat=...\tools\hashcat-7.1.2\hashcat.exe
+Host tools: hashcat=...\tools\hashcat-7.1.2\hashcat.exe
 GPU backend: cuda
   CUDA GPU: NVIDIA GeForce RTX 4070 SUPER
 https://0.0.0.0:8443 listening
@@ -265,10 +297,10 @@ restored afterwards.
    actionable hints when nothing arrives (toggle Wi-Fi on the test device,
    check SSID/band, move closer). The result is saved as
    `handshake-<date>-<BSSID>-.pcapng`.
-5. Send the capture to the tower via menu item **3 – Send capture**.
+5. Send the capture to the host via menu item **3 – Send capture**.
 
 ### Step 3 – Have it cracked
-The tower lists its wordlists/rules in the API; attacks start via `--attack`
+The host lists its wordlists/rules in the API; attacks start via `--attack`
 JSON through the client (see below). Live status runs over WebSocket (with
 polling fallback):
 ```
@@ -278,7 +310,7 @@ At the end it shows `Password found: <pw>` or `Password not found with this atta
 
 ### Step 4 – Reattach later
 Reattach to a running job via `--watch <job-id>`. The job keeps running on the
-tower even if the tethering connection drops.
+host even if the tethering connection drops.
 
 ### Certificate pinning
 On first contact the SHA256 fingerprint is shown and confirmed once (stored in
@@ -289,7 +321,7 @@ fully trust the network).
 
 ## 5. Choosing the attack (scripts/engine)
 
-The tower lists its wordlists/rules in the API. With `--attack attack.json` on
+The host lists its wordlists/rules in the API. With `--attack attack.json` on
 the command line you choose a wordlist and/or mask; the engine builds:
 
 ```json
@@ -307,7 +339,7 @@ and `backend` (`cuda`/`opencl`/`hip`).
 
 ## 6. GPU backend
 
-The tower detects backends automatically via `hashcat -I`:
+The host detects backends automatically via `hashcat -I`:
 
 | GPU | Backend |
 |---|---|
@@ -322,7 +354,7 @@ long as a GPU is present.
 
 ---
 
-## 7. HTTP API (tower)
+## 7. HTTP API (host)
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -338,7 +370,7 @@ long as a GPU is present.
 `X-Attack` is Base64-encoded JSON of the attack parameters.
 
 Uploads are limited to 64 MiB by default (changeable with `--max-upload-mb`
-on the tower; `options: --tower URL, --serve, --port N, --max-upload-mb ...`).
+on the host; `options: --tower URL, --serve, --port N, --max-upload-mb ...`).
 
 ---
 
@@ -351,6 +383,7 @@ environment variable).
 ~/.wifi-handshake/
 ├── tower-cert.pem / tower-key.pem   # TLS (auto-generated)
 ├── known_hosts.json                 # pinned fingerprints (client)
+├── config.json                      # tailscale_socket + tower_name (optional)
 ├── tower.potfile                    # hashcat potfile (saves compute time)
 └── jobs/<job-id>/
     ├── status.json                  # state + live values + command
@@ -387,12 +420,12 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 |---|---|
 | `./OpenCL/: No such file or directory` | hashcat runs with the wrong working directory. The engine sets `cwd` to the hashcat folder automatically. |
 | `hashcat exited with code ...` | check `hashcat.log` in the job folder (driver, `--force` needed?). |
-| `Upload is a raw capture but hcxpcapngtool is not available` | `hcxtools` is missing on the tower (no Windows binary). Install `pacman -S hcxtools` on the laptop — the client then converts locally. |
-| `Unknown or disallowed file: x.txt` | wordlist is not in a tower wordlist folder. |
-| `Certificate fingerprint mismatch` | certificate of the tower was recreated. Adjust `known_hosts.json` or connect with `--insecure`. |
-| Upload always fails / "connection reset" | old towers crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the tower with this build; the limit now defaults to 64 MiB. |
+| `Upload is a raw capture but hcxpcapngtool is not available` | `hcxtools` is missing on the host (no Windows binary). Install `pacman -S hcxtools` on the laptop — the client then converts locally. |
+| `Unknown or disallowed file: x.txt` | wordlist is not in a host wordlist folder. |
+| `Certificate fingerprint mismatch` | certificate of the host was recreated. Adjust `known_hosts.json` or connect with `--insecure`. |
+| Upload always fails / "connection reset" | old hosts crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the host with this build; the limit now defaults to 64 MiB. |
 | hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
-| "No tower set" | set the tower URL with `--tower URL` or enter it in menu item 3. |
+| "No host set" | set the host URL with `--tower URL` or enter it in menu item 3. |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
 
 ---
@@ -402,7 +435,7 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 * **No hcxtools auto-install on Windows** — conversion happens on the Linux
   laptop by default.
 * The capture part only runs **on Linux** (iw/airodump-ng/tshark). On
-  macOS/Windows only the tower and client upload are available.
+  macOS/Windows only the host and client upload are available.
 * **Monitor mode is hardware**: no software can make a card capture if its
   driver/firmware does not expose monitor mode. The tool covers the common
   setup paths, but it cannot create the capability.
@@ -448,7 +481,7 @@ self-contained `.hc22000` upload, and GPU cracking over Tailscale.
 Start (menu):
   python wifi-handshake.py                  # interactive terminal menu
   python wifi-handshake.py --run-capture     # capture directly (Linux)
-  python wifi-handshake.py --serve --port 8443   # tower server
+  python wifi-handshake.py --serve --port 8443   # host server
   python wifi-handshake.py --tower URL --send cap.pcapng   # client upload
   python wifi-handshake.py --self-test       # engine tests, no radio
   python wifi-handshake.py --inspect cap.pcapng   # find a handshake offline
@@ -459,7 +492,7 @@ Capture flow (menu item 1):
   choose adapter -> confirm YES -> scan -> pick a network
   -> select EAPOL set (M1+M2 default) -> wait for a handshake
   -> saved as handshake-<date>-<BSSID>.pcapng
-  -> offer to send to the tower, then back to the menu
+  -> offer to send to the host, then back to the menu
   -> q quit / r rescan
 
 Band/channel options (--run-capture):

@@ -225,7 +225,9 @@ def tailscale_available():
 
 
 def tailscale_socket():
-    return os.environ.get(TAILSCALE_SOCKET_ENV)
+    """Socket for a root-less tailscaled, from env or config.json."""
+    return (os.environ.get(TAILSCALE_SOCKET_ENV)
+            or load_config().get("tailscale_socket"))
 
 
 def tailscale_command(*args):
@@ -327,7 +329,7 @@ def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
 def print_tailscale_status(status=None):
     """Print a human-readable tailnet summary and return the status dict."""
     if not tailscale_available():
-        warn("Tailscale is not installed. Install it to reach the tower over the tailnet.")
+        warn("Tailscale is not installed. Install it to reach the host over the tailnet.")
         return None
     status = status or tailscale_status()
     if not status:
@@ -386,7 +388,7 @@ def choose_tailscale_tower(args):
     status = print_tailscale_status()
     if not status or status["state"] != "Running" or not status["peers"]:
         return None
-    answer = input("Use a peer as tower (number), or Enter to skip: ").strip()
+    answer = input("Use a peer as host (number), or Enter to skip: ").strip()
     if not answer.isdecimal() or not 1 <= int(answer) <= len(status["peers"]):
         return None
     peer = status["peers"][int(answer) - 1]
@@ -394,7 +396,7 @@ def choose_tailscale_tower(args):
     if not host:
         return None
     args.tower = f"https://{host}:{getattr(args, 'port', DEFAULT_PORT)}"
-    ok("Tower URL set to " + args.tower)
+    ok("Host URL set to " + args.tower)
     return args.tower
 
 
@@ -422,6 +424,96 @@ def ping_latency(host, timeout=TOWER_PROBE_TIMEOUT):
     return float(match.group(1)) if match else None
 
 
+def tailscale_proxy():
+    """Return ``(host, port)`` of a SOCKS5 proxy for the tailnet, or None.
+
+    In userspace networking mode (no root) tailscaled can serve a SOCKS5
+    proxy; without it the tailnet IPs are not reachable from the host. The
+    proxy is found via ``WIFI_HANDSHAKE_TAILSCALE_PROXY=socks5://host:port``
+    or the tailscaled default ``127.0.0.1:1056``.
+    """
+    host, port = "127.0.0.1", 1056
+    env = os.environ.get("WIFI_HANDSHAKE_TAILSCALE_PROXY")
+    if env:
+        parsed = urllib.parse.urlsplit(env if "://" in env else "//" + env)
+        host = parsed.hostname or host
+        try:
+            port = parsed.port or port
+        except ValueError:
+            pass
+    try:
+        sock = socket.create_connection((host, port), timeout=0.4)
+        sock.close()
+        return host, port
+    except OSError:
+        return None
+
+
+def _socks5_connect(proxy, host, port, timeout):
+    """Connect ``host:port`` through a SOCKS5 proxy and return the socket."""
+    proxy_host, proxy_port = proxy
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")  # SOCKS5, one method: no authentication
+        if sock.recv(2) != b"\x05\x00":
+            raise OSError("SOCKS5 proxy rejected no-auth.")
+        if ":" in host:
+            address = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
+        else:
+            address = b"\x01" + socket.inet_aton(host)
+        sock.sendall(b"\x05\x01\x00" + address + struct.pack(">H", port))
+        header = sock.recv(4)
+        if len(header) != 4 or header[1] != 0:
+            raise OSError("SOCKS5 connect failed.")
+        if header[3] == 1:
+            sock.recv(6)
+        elif header[3] == 4:
+            sock.recv(18)
+        else:
+            size = sock.recv(1)[0]
+            sock.recv(size + 2)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
+    """Return ``(connected_socket, connect_ms)``, trying direct then SOCKS5.
+
+    Direct connections are used when possible; when they fail and a tailnet
+    SOCKS5 proxy is available the connection is retried through it, which is
+    what makes userspace (root-less) Tailscale mode work.
+    """
+    last_error = None
+    try:
+        started = time.monotonic()
+        sock = socket.create_connection((host, port), timeout=timeout)
+        return sock, (time.monotonic() - started) * 1000.0
+    except OSError as exc:
+        last_error = exc
+    proxy = tailscale_proxy()
+    if proxy:
+        try:
+            started = time.monotonic()
+            sock = _socks5_connect(proxy, host, port, timeout)
+            return sock, (time.monotonic() - started) * 1000.0
+        except OSError as exc:
+            last_error = exc
+    raise last_error if last_error else OSError("connection failed")
+
+
+def connect_latency(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
+    """Milliseconds to open a connection (direct or via SOCKS5), or None."""
+    try:
+        sock, elapsed = open_socket(host, port, timeout)
+        sock.close()
+        return elapsed
+    except OSError:
+        return None
+
+
 def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
     """Return ``(scheme, health)`` if a tower answers at host:port, else None.
 
@@ -439,6 +531,13 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
                 conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
             else:
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            # Route through the tailnet SOCKS5 proxy when direct fails
+            # (userspace Tailscale mode). http.client calls this hook with
+            # ``(address, timeout, source_address)``; ignore its arguments and
+            # connect through open_socket instead.
+            def _make_connection(address, connect_timeout=None, source_address=None, **kwargs):
+                return open_socket(host, port, connect_timeout or timeout)[0]
+            conn._create_connection = _make_connection
             conn.request("GET", "/api/v1/health")
             response = conn.getresponse()
             data = response.read()
@@ -482,6 +581,10 @@ def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIM
     def probe(entry):
         host = entry["ip"] or entry["dns_name"]
         entry["latency"] = ping_latency(host, timeout) if host else None
+        if entry["latency"] is None and host:
+            # ICMP is unavailable (userspace mode, firewalled peer): fall
+            # back to the TCP connect time through the direct/SOCKS5 path.
+            entry["latency"] = connect_latency(host, port, timeout)
         found = probe_tower(host, port, timeout) if host else None
         entry["tower"] = found is not None
         if found:
@@ -512,7 +615,7 @@ def print_tailnet_devices(devices):
             backend = str(health.get("backend") or "auto")[:8]
             hashcat = str(health.get("hashcat_version") or "-")[:12]
         else:
-            backend, hashcat = "(no tower)", "-"
+            backend, hashcat = "(no host)", "-"
         print(f"  {index:>3}  {name:<24} {device['ip']:<16} {ping:>7}  "
               f"{backend:<9} {hashcat}")
     info("* marks this device.")
@@ -526,7 +629,7 @@ def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_
 
 def print_tailnet_towers(towers):
     if not towers:
-        info("No running tower found in the tailnet.")
+        info("No running host found in the tailnet.")
         return
     print(style(f"  {'#':>3}  {'Host':<24} {'Backend':<12} URL", "bold"))
     for index, tower in enumerate(towers, 1):
@@ -562,12 +665,12 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
                 devices = scan_tailnet_devices(port, status, timeout)
                 continue
             if answer == "m":
-                args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
+                args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
                 return args.tower
             return None
         has_tower = any(device.get("tower") for device in shown)
         if not has_tower:
-            info("None of these devices runs a tower.")
+            info("None of these devices runs a host.")
         extra = "" if has_tower else ", m=manual URL"
         info(f"Number to pick, text to filter, r=rescan{extra}, q=cancel.")
         answer = input("Device: ").strip()
@@ -579,18 +682,18 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
             query = None
             continue
         if low == "m" and not has_tower:
-            args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
+            args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
             return args.tower
         if answer.isdecimal() and 1 <= int(answer) <= len(shown):
             device = shown[int(answer) - 1]
             if not device.get("tower"):
-                warn(f"{device['hostname']} does not run a tower.")
+                warn(f"{device['hostname']} does not run a host.")
                 continue
             if input(f"Connect to {device['hostname']} at {device['url']}? [Y/n] "
                      ).strip().lower() in ("n", "no"):
                 continue
             args.tower = device["url"]
-            ok("Tower set to " + args.tower)
+            ok("Host set to " + args.tower)
             return args.tower
         query = low
         if not shown:
@@ -601,14 +704,16 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
 def resolve_tower(args, name=None):
     """Resolve ``args.tower`` from a tailnet peer name (non-interactive).
 
-    Only the named peer (``--tower-name`` or the default ``tower``) is looked
+    Only the named peer (``--tower-name``, the ``tower_name`` setting in
+    ``~/.wifi-handshake/config.json``, or the default ``tower``) is looked
     up; nothing is scanned and the user is never prompted. Returns the URL.
     """
     if getattr(args, "tower", None):
         return args.tower
     if not tailscale_available():
         return None
-    wanted = name or getattr(args, "tower_name", None) or "tower"
+    wanted = (name or getattr(args, "tower_name", None)
+              or load_config().get("tower_name") or "tower")
     url = tailscale_tower_url(wanted, getattr(args, "port", DEFAULT_PORT))
     if url:
         ok(f"Found tailnet peer '{wanted}': {url}")
@@ -622,7 +727,7 @@ def prompt_tower(args):
         return args.tower
     if tailscale_available() and choose_tailnet_device(args):
         return args.tower
-    args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
+    args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
     return args.tower
 
 
@@ -1555,6 +1660,22 @@ def app_dir():
     return Path(override) if override else Path.home() / ".wifi-handshake"
 
 
+def load_config():
+    """Read ``~/.wifi-handshake/config.json`` into a dict (empty if absent).
+
+    Supported keys: ``tailscale_socket`` (path to a root-less tailscaled
+    socket) and ``tower_name`` (default tailnet host of the tower).
+    """
+    path = app_dir() / "config.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def default_tools_dir():
     # Keep the GPU toolchain next to the script so hashcat's ./OpenCL kernels and
     # session logs stay inside the project instead of a shared installation.
@@ -2248,7 +2369,7 @@ class TowerWorker(threading.Thread):
         upload = job_dir / job["filename"]
         hashcat = self.tools.get("hashcat")
         if hashcat is None:
-            raise RuntimeError("hashcat was not found on the tower. Run --install-tools.")
+            raise RuntimeError("hashcat was not found on the host. Run --install-tools.")
         if not upload.is_file():
             raise RuntimeError("Uploaded capture is missing.")
         hash_file = upload
@@ -2256,7 +2377,7 @@ class TowerWorker(threading.Thread):
             converter = self.tools.get("hcxpcapngtool")
             if converter is None:
                 raise RuntimeError("Upload is a raw capture but hcxpcapngtool is not available on the "
-                                   "tower. Convert on the laptop or install hcxtools.")
+                                   "host. Convert on the laptop or install hcxtools.")
             self.store.update(job_id, state="converting")
             hash_file = job_dir / "capture.hc22000"
             result = subprocess.run([str(converter), "-o", str(hash_file), str(upload)],
@@ -2321,7 +2442,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
     server_version = "wifi-handshake-tower"
 
     def log_message(self, fmt, *args):
-        print(f"[tower] {self.address_string()} {fmt % args}", flush=True)
+        print(f"[host] {self.address_string()} {fmt % args}", flush=True)
 
     @property
     def store(self):
@@ -2450,7 +2571,7 @@ def serve(args):
     for directory in config.wordlist_dirs:
         directory.mkdir(parents=True, exist_ok=True)
     tools = discover_tools(config)
-    print(f"Tower tools: hashcat={tools.get('hashcat')} hcxpcapngtool={tools.get('hcxpcapngtool')}")
+    print(f"Host tools: hashcat={tools.get('hashcat')} hcxpcapngtool={tools.get('hcxpcapngtool')}")
     devices = backend_summary(tools.get("backends") or {})
     print(f"GPU backend: {tools.get('backend') or 'auto (none detected)'}")
     for line in devices:
@@ -2466,7 +2587,7 @@ def serve(args):
     if context:
         server.socket = context.wrap_socket(server.socket, server_side=True)
     scheme = "https" if context else "http"
-    print(f"Tower listening on {scheme}://{config.host}:{config.port}")
+    print(f"Host listening on {scheme}://{config.host}:{config.port}")
     print(f"Jobs: {config.jobs_dir}  Wordlists: {[str(d) for d in config.wordlist_dirs]}")
     tailnet = tailscale_status()
     if tailnet and tailnet["state"] == "Running" and tailnet["self_ip"]:
@@ -2476,7 +2597,7 @@ def serve(args):
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down tower...")
+        print("\nShutting down host...")
     finally:
         worker.stop()
         server.shutdown()
@@ -2521,8 +2642,8 @@ class TowerClient:
         self.fingerprint = fingerprint
         self.insecure = insecure
         self.confirm = confirm or (lambda digest: input(
-            f"Tower certificate fingerprint (sha256): {digest}\n"
-            "Trust this tower and remember it? Type YES: ").strip() == "YES")
+            f"Host certificate fingerprint (sha256): {digest}\n"
+            "Trust this host and remember it? Type YES: ").strip() == "YES")
         self.last_fingerprint = None
 
     def base(self):
@@ -2539,13 +2660,13 @@ class TowerClient:
             return
         der = sock.getpeercert(binary_form=True)
         if not der:
-            raise RuntimeError("Tower presented no certificate.")
+            raise RuntimeError("Host presented no certificate.")
         digest = hashlib.sha256(der).hexdigest()
         self.last_fingerprint = digest
         expected = (self.fingerprint or known_fingerprint(self.host, self.port) or "").replace(":", "").lower()
         if not expected:
             if not self.confirm(digest):
-                raise RuntimeError("Tower certificate not trusted.")
+                raise RuntimeError("Host certificate not trusted.")
             remember_fingerprint(self.host, self.port, digest)
             return
         if digest.lower() != expected:
@@ -2572,7 +2693,7 @@ class TowerClient:
             response = conn.getresponse()
             data = response.read()
             if response.status >= 400:
-                raise RuntimeError(f"Tower error {response.status}: {clean(data.decode(errors='replace')[:400])}")
+                raise RuntimeError(f"Host error {response.status}: {clean(data.decode(errors='replace')[:400])}")
             return json.loads(data.decode()) if data else {}
         finally:
             conn.close()
@@ -2665,7 +2786,7 @@ def choose_attack(client, attack_file=None):
     attack = {}
     if kind in (0, 2, 3):
         if not wordlists:
-            raise RuntimeError("The tower lists no wordlists. Add .txt files to its wordlist folder.")
+            raise RuntimeError("The host lists no wordlists. Add .txt files to its wordlist folder.")
         print("\nWordlists:")
         for index, item in enumerate(wordlists, 1):
             print(f"  {index}. {item['name']} ({item['size']} bytes)")
@@ -2715,7 +2836,7 @@ def watch_job(client, job_id, tower_url):
         return 0
     result = job.get("result") or {}
     if job["state"] == "failed":
-        print(f"Tower error: {job.get('error')}")
+        print(f"Host error: {job.get('error')}")
     elif result.get("found"):
         print(f"Password found: {result['password']}")
     else:
@@ -2734,7 +2855,7 @@ def prepare_capture(path):
         return path
     converter = find_tool("hcxpcapngtool")
     if converter is None:
-        print("hcxpcapngtool not found locally; sending the raw capture for the tower to convert.")
+        print("hcxpcapngtool not found locally; sending the raw capture for the host to convert.")
         return path
     out = path.with_suffix(".hc22000")
     result = subprocess.run([str(converter), "-o", str(out), str(path)],
@@ -2750,7 +2871,7 @@ def prepare_capture(path):
 def send_capture(args):
     client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
     health = client.health()
-    print(f"Tower: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
+    print(f"Host: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
     capture_path = prepare_capture(args.send)
     attack = choose_attack(client, args.attack)
     print("Attack: " + json.dumps(attack))
@@ -3111,7 +3232,7 @@ def run_interactive(args):
         heading("wifi-handshake - Terminal Menu")
         print("  " + style("1", "bold") + ". Capture handshake  "
               + style("(Linux, monitor mode, root)", "dim"))
-        print("  " + style("2", "bold") + ". Start tower        "
+        print("  " + style("2", "bold") + ". Start host         "
               + style("(server + hashcat, for the GPU box)", "dim"))
         print("  " + style("3", "bold") + ". Send capture       "
               + style("(client: list tailnet devices, then upload)", "dim"))
@@ -3122,27 +3243,27 @@ def run_interactive(args):
         print("  " + style("6", "bold") + ". Example captures   "
               + style("(download public test data)", "dim"))
         print("  " + style("7", "bold") + ". Tailscale          "
-              + style("(status, log in, pick the tower in your tailnet)", "dim"))
+              + style("(status, log in, pick the host in your tailnet)", "dim"))
         print("  " + style("8", "bold") + ". Devices            "
-              + style("(list reachable tailnet devices, pick the tower)", "dim"))
+              + style("(list reachable tailnet devices, pick the host)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
             code, captured = menu_capture(args)
             if code == 0 and captured:
-                if input("Send this capture to a tower now? [y/N] ").strip().lower() == "y":
+                if input("Send this capture to a host now? [y/N] ").strip().lower() == "y":
                     if prompt_tower(args):
                         args.send = Path(captured)
                         run_headless(args)
                     else:
-                        print("No tower URL set. Capture kept at " + captured)
+                        print("No host URL set. Capture kept at " + captured)
             continue
         if choice == "2":
             serve(args)
             continue
         if choice == "3":
             if not choose_tailnet_device(args):
-                warn("No tower selected. Aborting.")
+                warn("No host selected. Aborting.")
                 continue
             if not args.send:
                 cap = input("Path to capture file (.pcapng/.hc22000): ").strip()
@@ -3197,13 +3318,13 @@ def run_interactive(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="wifi-handshake",
-        description="Passive Wi-Fi handshake capture and tower GPU cracking. "
+        description="Passive Wi-Fi handshake capture and host GPU cracking. "
                     "Run without arguments for the interactive terminal menu.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python wifi-handshake.py                  # interactive menu
   python wifi-handshake.py --tower URL     # client: upload a capture
-  python wifi-handshake.py --serve --port 8443   # tower: GPU box
+  python wifi-handshake.py --serve --port 8443   # host: GPU box
   python wifi-handshake.py --run-capture   # capture directly (Linux, sudo)
   python wifi-handshake.py --self-test     # offline tests
   python wifi-handshake.py --install-tools # download hashcat for the tower
@@ -3212,27 +3333,27 @@ def build_parser():
   python wifi-handshake.py --download-captures   # fetch example captures
   python wifi-handshake.py --tailscale-status    # show the tailnet and peers
   python wifi-handshake.py --list-devices        # list reachable tailnet devices
-  python wifi-handshake.py --discover-towers     # scan the tailnet for running towers
-  python wifi-handshake.py --send cap.pcapng --tower-name tower  # find tower via Tailscale
+  python wifi-handshake.py --discover-towers     # scan the tailnet for running hosts
+  python wifi-handshake.py --send cap.pcapng --tower-name my-host  # find host via Tailscale
 
-Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the tower
+Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the host
 and client roles work on every platform. Capture dependencies on Arch:
   sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
 
 No deauthentication, injection or radio interference anywhere in this tool.
 Only test networks you own or have permission to test.
 """)
-    parser.add_argument("--tower", help="tower base URL, e.g. https://tower:8443")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"tower port, default {DEFAULT_PORT}")
+    parser.add_argument("--tower", help="host base URL, e.g. https://tower:8443")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"host port, default {DEFAULT_PORT}")
     parser.add_argument("--bind", default="0.0.0.0", help="server bind address, default 0.0.0.0")
     parser.add_argument("--tools-dir", type=Path, help="folder holding hashcat")
     parser.add_argument("--output-dir", type=Path, help="where captures are saved")
     parser.add_argument("--insecure", action="store_true", help="skip certificate pinning")
-    parser.add_argument("--serve", action="store_true", help="start the tower server (alternative to menu choice 2)")
+    parser.add_argument("--serve", action="store_true", help="start the host server (alternative to menu choice 2)")
     parser.add_argument("--install-tools", action="store_true", help="download, verify and unpack hashcat")
     parser.add_argument("--self-test", action="store_true", help="run offline tests and exit")
 
-    server = parser.add_argument_group("tower server (--serve)")
+    server = parser.add_argument_group("host server (--serve)")
     server.add_argument("--jobs-dir", type=Path, help="where jobs and results are stored")
     server.add_argument("--wordlist-dirs", type=Path, action="append", help="wordlist folders")
     server.add_argument("--rule-dirs", type=Path, action="append", help="hashcat rule folders")
@@ -3271,17 +3392,18 @@ Only test networks you own or have permission to test.
     headless.add_argument("--send", type=Path, help="send this capture instead of capturing")
     headless.add_argument("--watch", help="reattach to an existing job id")
     headless.add_argument("--attack", type=Path, help="JSON file with attack parameters")
-    headless.add_argument("--fingerprint", help="pinned tower certificate sha256 fingerprint")
+    headless.add_argument("--fingerprint", help="pinned host certificate sha256 fingerprint")
 
-    tailscale = parser.add_argument_group("tailscale (tower discovery over the tailnet)")
-    tailscale.add_argument("--tower-name", help="tailnet hostname of the tower "
-                                                "(default when discovering: tower)")
+    tailscale = parser.add_argument_group("tailscale (host discovery over the tailnet)")
+    tailscale.add_argument("--tower-name", help="tailnet hostname of the host "
+                                                "(default: config.json tower_name, "
+                                                "or 'tower')")
     tailscale.add_argument("--tailscale-status", action="store_true",
                            help="print tailnet status and peers, then exit")
     tailscale.add_argument("--tailscale-login", action="store_true",
                            help="join the tailnet (`tailscale up`), then exit")
     tailscale.add_argument("--discover-towers", action="store_true",
-                           help="scan tailnet peers for running towers, then exit")
+                           help="scan tailnet peers for running hosts, then exit")
     tailscale.add_argument("--list-devices", action="store_true",
                            help="list all reachable tailnet devices, then exit")
     return parser
@@ -3290,7 +3412,7 @@ Only test networks you own or have permission to test.
 def run_capture_cli(args):
     if not capture_supported():
         raise RuntimeError("Live capture needs Linux (iw/airodump-ng/tshark). "
-                           "On other systems use --serve for the tower or --send/--watch.")
+                           "On other systems use --serve for the host or --send/--watch.")
     if args.scan_seconds < 3 or args.timeout < 0 or args.max_mb < 1:
         raise RuntimeError("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
     if not sys.stdin.isatty():
@@ -3450,7 +3572,7 @@ def run_headless(args):
         if not args.tower and interactive:
             choose_tailnet_device(args)
         if not args.tower:
-            raise RuntimeError("--watch needs a tower: pass --tower URL or --tower-name NAME, "
+            raise RuntimeError("--watch needs a host: pass --tower URL or --tower-name NAME, "
                                "or list devices with --list-devices.")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         return watch_job(client, args.watch, args.tower)
@@ -3459,11 +3581,11 @@ def run_headless(args):
         if not args.tower and interactive:
             choose_tailnet_device(args)
         if not args.tower:
-            raise RuntimeError("--send needs a tower: pass --tower URL or --tower-name NAME, "
+            raise RuntimeError("--send needs a host: pass --tower URL or --tower-name NAME, "
                                "or list devices with --list-devices.")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         health = client.health()
-        print(f"Tower: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
+        print(f"Host: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
         attack = choose_attack(client, args.attack)
         print("Attack: " + json.dumps(attack))
         job_id = client.create_job(prepare_capture(args.send), attack)["job_id"]
