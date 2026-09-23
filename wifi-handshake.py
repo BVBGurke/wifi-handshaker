@@ -310,14 +310,14 @@ def tailscale_peer(name, status=None):
 
 
 def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
-    """Build a tower URL from a tailnet peer's MagicDNS name or IP, or None."""
+    """Build a tower URL from a tailnet peer's IP address, or None."""
     status = tailscale_status()
     if not tailscale_ready(status):
         return None
     peer = tailscale_peer(name, status)
     if not peer:
         return None
-    host = peer["dns_name"] or peer["ip"]
+    host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
     return f"{scheme}://{host}:{port}"
@@ -346,11 +346,11 @@ def print_tailscale_status(status=None):
     if not status["peers"]:
         info("No peers in the tailnet yet.")
         return status
-    print(style(f"  {'#':>3}  {'Online':<7} {'Host':<24} {'OS':<9} Address", "bold"))
+    print(style(f"  {'#':>3}  {'Online':<7} {'Host':<24} {'OS':<9} IP", "bold"))
     for index, peer in enumerate(status["peers"], 1):
         mark = "yes" if peer["online"] else "no"
         print(f"  {index:>3}  {mark:<7} {peer['hostname'][:23]:<24} {peer['os'][:8]:<9} "
-              f"{peer['dns_name'] or peer['ip']}")
+              f"{peer['ip'] or peer['dns_name']}")
     return status
 
 
@@ -389,7 +389,7 @@ def choose_tailscale_tower(args):
     if not answer.isdecimal() or not 1 <= int(answer) <= len(status["peers"]):
         return None
     peer = status["peers"][int(answer) - 1]
-    host = peer["dns_name"] or peer["ip"]
+    host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
     args.tower = f"https://{host}:{getattr(args, 'port', DEFAULT_PORT)}"
@@ -2269,9 +2269,9 @@ def serve(args):
     print(f"Tower listening on {scheme}://{config.host}:{config.port}")
     print(f"Jobs: {config.jobs_dir}  Wordlists: {[str(d) for d in config.wordlist_dirs]}")
     tailnet = tailscale_status()
-    if tailnet and tailnet["state"] == "Running" and tailnet["self_dns_name"]:
-        print(f"Reachable in the tailnet as {tailnet['self_dns_name']} "
-              f"(use: --tower https://{tailnet['self_dns_name']}:{config.port})")
+    if tailnet and tailnet["state"] == "Running" and tailnet["self_ip"]:
+        print(f"Reachable in the tailnet as {tailnet['self_ip']} "
+              f"(use: --tower https://{tailnet['self_ip']}:{config.port})")
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()

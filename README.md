@@ -65,11 +65,13 @@ from a shell (`--run-capture`).
 * Tailscale installed and in the same tailnet as the laptop.
 
 ### Network
-* Both devices in the same tailnet (e.g. `tower` reachable via MagicDNS).
+* Both devices in the same tailnet. Discovery matches the tower by its tailnet
+  hostname and connects to its tailnet **IP** (`100.x.y.z`), so MagicDNS is not
+  required.
 * The tower does not need to be publicly reachable — Tailscale handles NAT traversal.
 * Join the tailnet on each device with `sudo tailscale up`, or from the tool with
   `python wifi-handshake.py --tailscale-login` (menu item **7 – Tailscale**).
-  `--tailscale-status` shows the peers and the MagicDNS names used for discovery.
+  `--tailscale-status` shows the peers and their tailnet IPs.
 
 ---
 
@@ -158,16 +160,16 @@ python wifi-handshake.py --tailscale-login    # join the tailnet (`tailscale up`
 python wifi-handshake.py --send capture.pcapng --tower-name tower
 ```
 
-`--tailscale-status` prints the login state, this device's tailnet name/IP and a
-numbered list of peers. `--tower-name NAME` looks that peer up by its **MagicDNS
-hostname** and builds `https://NAME.<tailnet>.ts.net:<port>` (the default name
-when discovering is `tower`). Without `--tower`, an upload (`--send`/`--watch`)
-also falls back to discovering a peer named `tower`. Menu item **7 – Tailscale**
-does all of this interactively and lets you store a peer as the tower for later
-sends.
+`--tailscale-status` prints the login state, this device's tailnet IP and a
+numbered list of peers. `--tower-name NAME` looks that peer up by its hostname
+and builds the tower URL from its **tailnet IP**, e.g.
+`https://100.x.y.z:<port>` (the default name when discovering is `tower`).
+Without `--tower`, an upload (`--send`/`--watch`) also falls back to discovering
+a peer named `tower`. Menu item **7 – Tailscale** does all of this interactively
+and lets you store a peer as the tower for later sends.
 
-`--serve` prints the MagicDNS name the tower is reachable at, e.g.
-`use: --tower https://tower.tailnet.ts.net:8443`.
+`--serve` prints the tailnet IP the tower is reachable at, e.g.
+`use: --tower https://100.x.y.z:8443`.
 
 If Tailscale is not installed or the daemon is not running the helpers only warn
 and the tool keeps working with an explicit `--tower URL`. A userspace daemon
