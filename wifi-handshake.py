@@ -58,6 +58,16 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Windows console: when stdout/stderr is redirected, Python falls back to the
+# ANSI codepage (e.g. cp1252), which cannot encode the ✓ and emoji used in the
+# UI and would crash the menu on any non-ASCII output. Force UTF-8 with lossy
+# replacement so output can never raise UnicodeEncodeError.
+for _output_stream in (sys.stdout, sys.stderr):
+    try:
+        _output_stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 MAC = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 DEFAULT_PORT = 8443
 FIELDS = ["frame.number", "frame.time_epoch", "wlan.bssid", "wlan.sa", "wlan.da",
@@ -117,16 +127,21 @@ def run(*args, check=True, timeout=30):
                             stderr=subprocess.PIPE, timeout=timeout,
                             encoding="utf-8", errors="replace")
     if check and result.returncode:
-        raise RuntimeError(f"{args[0]} failed: {clean(result.stderr.strip())}")
+        raise RuntimeError(f"{args[0]} failed: {clean((result.stderr or '').strip())}")
     return result
 
 
 def stop(proc):
     if proc is not None and proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
         try:
+            if os.name == "nt":
+                # send_signal(SIGINT) is NotImplementedError on Windows; the
+                # process has a separate console, so terminate() is reliable.
+                proc.terminate()
+            else:
+                proc.send_signal(signal.SIGINT)
             proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             proc.kill()
             proc.wait()
 
@@ -613,8 +628,20 @@ def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIM
         return entry
 
     if entries:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(entries))) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(entries)))
+        interrupted = False
+        try:
             entries = list(pool.map(probe, entries))
+        except KeyboardInterrupt:
+            # Return immediately; leave the in-flight probes to drain in the
+            # background (daemon threads) instead of blocking on them, so
+            # Ctrl+C is instant and no stray thread blocks interpreter exit.
+            interrupted = True
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            if not interrupted:
+                pool.shutdown(wait=True)
     entries.sort(key=lambda entry: (not entry["online"], entry["hostname"].lower()))
     return entries
 
@@ -1688,6 +1715,8 @@ def extract_hc22000(path, ssid=None):
     handshake is found.
     """
     path = Path(path)
+    if isinstance(ssid, str):
+        ssid = ssid.encode()
     m1 = {}
     m2 = {}
     known_ssid = None
@@ -1732,6 +1761,37 @@ def inspect_capture(path, ssid=None, password=None):
     path = Path(path)
     if not path.is_file():
         raise RuntimeError(f"Capture file not found: {path}")
+    if not shutil.which("tshark"):
+        # tshark is missing (e.g. the Windows host): fall back to the built-in
+        # pure-Python pcap parser and verify M1+M2 MICs directly.
+        lines = extract_hc22000(path, ssid)
+        heading("Capture: " + clean(path.name))
+        if not lines:
+            warn("No usable M1+M2 handshake found (built-in parser; tshark not installed).")
+            return {"handshakes": 0, "verified": 0, "mismatched": 0}
+        ok(f"{len(lines)} handshake line(s) found (built-in parser).")
+        if bool(ssid) != bool(password):
+            warn("MIC verification needs both --essid and --password; skipping verification.")
+            return {"handshakes": len(lines), "verified": 0, "mismatched": 0}
+        if not (ssid and password):
+            info("Pass --essid and --password to verify the MIC with a known passphrase.")
+            return {"handshakes": len(lines), "verified": 0, "mismatched": 0}
+        pmk = hashlib.pbkdf2_hmac("sha1", password.encode(), ssid.encode(), 4096, 32)
+        summary = {"handshakes": len(lines), "verified": 0, "mismatched": 0}
+        for line in lines:
+            parts = line.split("*")
+            mic = bytes.fromhex(parts[2])
+            ap, sta = bytes.fromhex(parts[3]), bytes.fromhex(parts[4])
+            anonce = bytes.fromhex(parts[6])
+            eapol = bytes.fromhex(parts[7])
+            kck = derive_ptk(pmk, ap, sta, anonce, eapol[17:49])[:16]
+            if hmac.new(kck, eapol, hashlib.sha1).digest()[:16] == mic:
+                summary["verified"] += 1
+                ok(f"  MIC verified for AP {ap.hex()}, client {sta.hex()}.")
+            else:
+                summary["mismatched"] += 1
+                fail(f"  MIC MISMATCH for AP {ap.hex()}, client {sta.hex()}.")
+        return summary
     text = run("tshark", "-n", "-r", str(path), *field_options()).stdout
     trackers, found = {}, []
     for line in text.splitlines():
