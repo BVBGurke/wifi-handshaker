@@ -17,7 +17,7 @@ from a shell (`--run-capture`).
    Laptop (Linux, Arch)                     Host (Windows + GPU)
    ┌───────────────────────┐   Tailscale   ┌──────────────────────────┐
    │ WLAN card monitor     │   + TLS/WS    │ HTTP/JSON + WebSocket    │
-   │ → Handshake (.pcapng) │ ────────────► │ hcxpcapngtool → .hc22000 │
+   │ → Handshake (.pcapng) │ ────────────► │ built-in parser → .hc22000 │
    │ Internet via USB      │               │ hashcat -m 22000 (GPU)   │
    │ tethering (phone)     │ ◄──────────── │ live status + password   │
    └───────────────────────┘               └──────────────────────────┘
@@ -85,12 +85,11 @@ Downloads the pinned `hashcat` version from GitHub, verifies the SHA256
 checksum and unpacks it into `tools\`. Alternatively use menu item
 **Install hashcat**.
 
-> **Important:** There is **no official Windows binary** for `hcxtools`
-> (ZerBea only publishes source). That is why by default the **Linux laptop**
-> does the conversion (there `hcxtools` is a package). The host only converts
-> if `hcxpcapngtool` is actually present. Without it the host cannot process
-> raw `.pcapng` files — send it `.hc22000` instead (the client does this
-> automatically).
+> **Conversion is built in:** raw `.pcapng`/`.pcap` captures are converted to
+> `.hc22000` by a pure-Python parser inside `wifi-handshake.py` — no tshark or
+> hcxtools required on either machine. `hcxpcapngtool` is optional and only
+> adds extra heuristics; when it is present it is used first (on the laptop
+> during `--send`, on the host when converting server-side).
 
 ### Laptop: capture tools
 ```
@@ -422,7 +421,7 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 |---|---|
 | `./OpenCL/: No such file or directory` | hashcat runs with the wrong working directory. The engine sets `cwd` to the hashcat folder automatically. |
 | `hashcat exited with code ...` | check `hashcat.log` in the job folder (driver, `--force` needed?). |
-| `Upload is a raw capture but hcxpcapngtool is not available` | `hcxtools` is missing on the host (no Windows binary). Install `pacman -S hcxtools` on the laptop — the client then converts locally. |
+| `No usable WPA handshake found in the capture` | the capture has no M1+M2 EAPOL exchange with a recoverable SSID. Let the target device reconnect (toggles Wi-Fi off/on) so a fresh four-way handshake appears; hidden SSIDs still work when a beacon with a probe/length is captured. |
 | `Unknown or disallowed file: x.txt` | wordlist is not in a host wordlist folder. |
 | `Certificate fingerprint mismatch` | certificate of the host was recreated. Adjust `known_hosts.json` or connect with `--insecure`. |
 | Upload always fails / "connection reset" | old hosts crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the host with this build; the limit now defaults to 64 MiB. |
@@ -434,8 +433,8 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 
 ## 11. Limits (honest)
 
-* **No hcxtools auto-install on Windows** — conversion happens on the Linux
-  laptop by default.
+* **Capture conversion is built in** — no hcxtools/tshark needed on either
+  machine; `hcxpcapngtool` only adds extra heuristics when present.
 * The capture part only runs **on Linux** (iw/airodump-ng/tshark). On
   macOS/Windows only the host and client upload are available.
 * **Monitor mode is hardware**: no software can make a card capture if its
@@ -464,7 +463,7 @@ reviewed while building the compatibility layer:
 | Project | What it is good for | Note |
 |---|---|---|
 | [ZerBea/hcxdumptool](https://github.com/ZerBea/hcxdumptool) | Modern capture of EAPOL handshakes **and PMKID**, best chipset coverage | Transmits association/deauth frames; not passive. Use `--disable_deauthentication` and only on your own network |
-| [ZerBea/hcxtools](https://github.com/ZerBea/hcxtools) | `hcxpcapngtool` converts captures to `.hc22000` | Recommended by hashcat; the client uses it locally |
+| [ZerBea/hcxtools](https://github.com/ZerBea/hcxtools) | `hcxpcapngtool` converts captures to `.hc22000` | Optional: used first when present, otherwise the built-in parser converts |
 | [derv82/wifite2](https://github.com/derv82/wifite2) | Automated audit workflow (scan → capture → crack) | Wraps aircrack-ng/hashcat; active by default |
 | [bettercap/bettercap](https://github.com/bettercap/bettercap) | Wi-Fi recon, PMKID, deauth in a scriptable framework | Active attacks |
 | [aircrack-ng/aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) | `airodump-ng` scanning and `aircrack-ng` cracking | Used here for scanning |

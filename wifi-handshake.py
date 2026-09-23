@@ -114,7 +114,8 @@ def ok(text):
 
 def run(*args, check=True, timeout=30):
     result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=timeout)
+                            stderr=subprocess.PIPE, timeout=timeout,
+                            encoding="utf-8", errors="replace")
     if check and result.returncode:
         raise RuntimeError(f"{args[0]} failed: {clean(result.stderr.strip())}")
     return result
@@ -249,7 +250,8 @@ def _tailscale(*args, timeout=10):
         return None
     try:
         return subprocess.run(command, text=True, timeout=timeout,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              encoding="utf-8", errors="replace")
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -415,12 +417,19 @@ def ping_latency(host, timeout=TOWER_PROBE_TIMEOUT):
         args = [binary, "-c", "1", "-W", str(seconds), host]
     try:
         result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=seconds + 2)
+                                stderr=subprocess.DEVNULL, timeout=seconds + 2,
+                                encoding="utf-8", errors="replace")
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode:
         return None
-    match = re.search(r"time[=<]\s*([\d.]+)\s*ms", result.stdout)
+    output = result.stdout or ""
+    # `time=` (English) vs `Zeit=` (German) vs `temps=`/`tempo=`/`tiempo=` —
+    # fall back to any "<number> ms" for other locales.
+    match = re.search(r"(?:time|zeit|temps?|tempo|tiempo)[=<]\s*([\d.]+)\s*ms",
+                      output, re.IGNORECASE)
+    if not match:
+        match = re.search(r"([\d.]+)\s*ms", output)
     return float(match.group(1)) if match else None
 
 
@@ -1540,6 +1549,181 @@ def verify_mic(eapol, parsed, pmk, aa, spa, anonce, snonce):
     return hmac.new(kck, bytes(body), hashlib.sha1).digest()[:16] == parsed["mic"]
 
 
+# --- Built-in capture -> hc22000 conversion (no tshark or hcxtools needed) ---
+# hashcat mode 22000 "WPA-PBKDF2-PMKID+EAPOL" needs only a handshake M1+M2:
+#
+#   WPA*02*MIC*MAC_AP*MAC_STA*ESSID*ANONCE*EAPOL*MESSAGEPAIR
+#
+# where EAPOL is the client's M2 frame (SNonce embedded, MIC zeroed) and
+# ANONCE comes from M1. Parsing pcap/pcapng and 802.11 frames in pure Python
+# makes raw-capture uploads work even where hcxtools/tshark are unavailable
+# (e.g. the Windows tower host).
+
+
+def _iter_pcapng(path):
+    """Yield ``(linktype, packet_bytes)`` from each packet of a pcapng file."""
+    data = Path(path).read_bytes()
+    n, pos, endian = len(data), 0, "big"
+    while pos + 16 <= n:
+        if data[pos:pos + 4] == b"\x0a\x0d\x0d\x0a":
+            bom = data[pos + 8:pos + 12]
+            endian = "big" if bom == bytes.fromhex("1a2b3c4d") else "little"
+            blen = int.from_bytes(data[pos + 4:pos + 8], endian)
+        else:
+            blen = int.from_bytes(data[pos + 4:pos + 8], endian)
+        if blen < 12 or pos + blen > n:
+            return
+        btype = int.from_bytes(data[pos:pos + 4], endian)
+        if btype == 1:  # Interface Description Block
+            linktype = int.from_bytes(data[pos + 8:pos + 10], endian)
+        elif btype == 6 or btype == 2:  # Enhanced / obsolete Packet Block
+            caplen = int.from_bytes(data[pos + 20:pos + 24], endian)
+            yield linktype, data[pos + 28:pos + 28 + caplen]
+        elif btype == 3:  # Simple Packet Block
+            caplen = blen - 16
+            yield linktype, data[pos + 12:pos + 12 + caplen]
+        pos += blen
+
+
+def _iter_pcap(path):
+    """Yield ``(linktype, packet_bytes)`` from a classic pcap file."""
+    data = Path(path).read_bytes()
+    if len(data) < 24:
+        return
+    magic = data[0:4]
+    if magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        endian = "big"
+    else:
+        endian = "little"
+    linktype = int.from_bytes(data[20:24], endian)
+    pos = 24
+    while pos + 16 <= len(data):
+        incl = int.from_bytes(data[pos + 8:pos + 12], endian)
+        end = pos + 16 + incl
+        if end > len(data):
+            return
+        yield linktype, data[pos + 16:end]
+        pos = end
+
+
+def _iter_80211(path):
+    """Yield raw 802.11 frames (radiotap/prism stripped) from a capture file."""
+    data = Path(path).read_bytes()
+    if data[0:4] == b"\x0a\x0d\x0d\x0a":
+        packets = _iter_pcapng(path)
+    else:
+        packets = _iter_pcap(path)
+    for linktype, packet in packets:
+        if linktype == 127:  # RadioTap
+            if len(packet) < 8:
+                continue
+            packet = packet[int.from_bytes(packet[2:4], "little"):]
+            linktype = 105
+        elif linktype == 119:  # Prism
+            packet = packet[144:]
+            linktype = 105
+        if linktype != 105 or len(packet) < 24:
+            continue
+        yield packet
+
+
+def _eapol_from_frame(packet):
+    """Return ``(ap, sta, eapol, parsed)`` for an EAPOL data frame, else None.
+
+    Understands the common monitor-mode layouts (plain 802.11 with 3 or 4
+    addresses and optional QoS header). AP/STA are derived from the To/From DS
+    bits: the AP sends M1/M3 (From DS), the client sends M2/M4 (To DS).
+    """
+    frame = int.from_bytes(packet[0:2], "little")
+    frame_type = (frame >> 2) & 0x3
+    if frame_type != 2:  # data frames only
+        return None
+    to_ds, from_ds = (frame >> 8) & 0x01, (frame >> 9) & 0x01
+    qos = ((frame >> 4) & 0x0f) & 0x08
+    header = 24 + (2 if qos else 0) + (6 if to_ds and from_ds else 0)
+    if len(packet) < header:
+        return None
+    addr1, addr2, addr3 = packet[4:10], packet[10:16], packet[16:22]
+    index = packet.find(EAPOL_SNAP, header)
+    if index < 0:
+        return None
+    eapol = packet[index + len(EAPOL_SNAP):]
+    parsed = parse_eapol_key(eapol)
+    if not parsed:
+        return None
+    if from_ds and not to_ds:        # AP -> client
+        return addr2, addr1, eapol, parsed
+    if to_ds and not from_ds:        # client -> AP
+        return addr1, addr2, eapol, parsed
+    return addr3, addr1, eapol, parsed  # WDS/relayed: best effort
+
+
+def _capture_ssid(packet):
+    """Return the SSID from a beacon/probe-response frame, or None."""
+    frame = int.from_bytes(packet[0:2], "little")
+    if (frame >> 2) & 0x3 != 0:  # management
+        return None
+    subtype = (frame >> 4) & 0x0f
+    if subtype not in (5, 8):  # probe response, beacon
+        return None
+    body = packet[24:]
+    if len(body) < 12:
+        return None
+    pos, size = 12, len(body)
+    while pos + 2 <= size:
+        tag, length = body[pos], body[pos + 1]
+        value = body[pos + 2:pos + 2 + length]
+        if tag == 0 and length and value != b"\xff" * length:
+            return value
+        pos += 2 + length
+    return None
+
+
+def extract_hc22000(path, ssid=None):
+    """Convert a pcap/pcapng capture into hashcat -m 22000 EAPOL hash lines.
+
+    Pairs M1 (ANonce) with M2 (EAPOL + MIC) per (AP, station, replay counter)
+    and returns unique ``WPA*02*...*00`` lines. ``ssid`` is used when the
+    capture contains no beacons (hidden SSID). Returns ``[]`` if no usable
+    handshake is found.
+    """
+    path = Path(path)
+    m1 = {}
+    m2 = {}
+    known_ssid = None
+    for packet in _iter_80211(path):
+        found = _capture_ssid(packet)
+        if found and known_ssid is None:
+            known_ssid = found
+        fields = _eapol_from_frame(packet)
+        if not fields:
+            continue
+        ap, sta, eapol, parsed = fields
+        key = (ap, sta, parsed["replay"])
+        if parsed["message"] == 1 and parsed["nonce"] != b"\x00" * 32:
+            m1.setdefault(key, parsed["nonce"])
+        elif parsed["message"] == 2 and parsed["mic"] != b"\x00" * 16:
+            mic = parsed["mic"]
+            body = eapol[:81] + (b"\x00" * 16) + eapol[97:]
+            m2.setdefault(key, (body, mic))
+    essid = ssid or known_ssid
+    if not essid:
+        return []
+    lines, seen = [], set()
+    for key, anonce in m1.items():
+        item = m2.get(key)
+        if not item:
+            continue
+        eapol, mic = item
+        line = "WPA*02*%s*%s*%s*%s*%s*%s*00" % (
+            mic.hex(), key[0].hex(), key[1].hex(),
+            essid.hex(), anonce.hex(), eapol.hex())
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    return lines
+
+
 def inspect_capture(path, ssid=None, password=None):
     """Report (and optionally verify) the four-way handshakes in a capture.
 
@@ -1776,7 +1960,8 @@ def extract_archive(archive, dest):
             pass
         if shutil.which("tar"):
             result = subprocess.run(["tar", "-xf", str(archive), "-C", str(dest)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace")
             if result.returncode == 0:
                 return dest
         raise RuntimeError("No 7z extractor found. Install 7-Zip or `pip install py7zr`.")
@@ -1788,9 +1973,9 @@ def install_tools(tools_dir):
     """Fetch the pinned hashcat build and explain the hcxtools situation.
 
     hashcat publishes a Windows binary, so it is downloaded, checksum-verified
-    and unpacked automatically. hcxtools publishes source only, so there is no
-    official Windows binary to install: convert captures on the Linux laptop, or
-    build hcxpcapngtool yourself and point --tools-dir at it.
+    and unpacked automatically. hcxtools is optional: raw captures are
+    converted by the built-in parser, and hcxpcapngtool only adds extra
+    heuristics when present.
     """
     tools_dir = Path(tools_dir or default_tools_dir())
     tools_dir.mkdir(parents=True, exist_ok=True)
@@ -1801,9 +1986,10 @@ def install_tools(tools_dir):
     extract_archive(archive, tools_dir)
     found = find_tool("hashcat", [tools_dir])
     print("hashcat: " + (str(found) if found else "NOT FOUND after extraction"))
-    print("hcxtools: no official Windows binary is published. Either")
-    print("  * run the conversion on the Linux laptop (pacman -S hcxtools), or")
-    print("  * build hcxpcapngtool yourself and place hcxpcapngtool.exe in " + str(tools_dir))
+    print("hcxtools: optional. Raw captures are converted by the built-in parser,")
+    print("  so hcxpcapngtool is only needed for its extra heuristics. If you want")
+    print("  it anyway: run the conversion on the Linux laptop (pacman -S hcxtools),")
+    print("  or build hcxpcapngtool yourself and place hcxpcapngtool.exe in " + str(tools_dir))
     return 0
 
 
@@ -2287,9 +2473,10 @@ def _openssl_self_signed(cert_path, key_path):
     result = subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                              "-keyout", str(key_path), "-out", str(cert_path), "-days", "3650",
                              "-subj", "/CN=wifi-handshake-tower"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace")
     if result.returncode:
-        print(clean(result.stderr[-400:]))
+        print(clean((result.stderr or "")[-400:]))
         return False
     print(f"Generated self-signed certificate via openssl: {cert_path}")
     return True
@@ -2403,19 +2590,24 @@ class TowerWorker(threading.Thread):
             raise RuntimeError("Uploaded capture is missing.")
         hash_file = upload
         if upload.suffix.lower() != ".hc22000":
-            converter = self.tools.get("hcxpcapngtool")
-            if converter is None:
-                raise RuntimeError("Upload is a raw capture but hcxpcapngtool is not available on the "
-                                   "host. Convert on the laptop or install hcxtools.")
             self.store.update(job_id, state="converting")
             hash_file = job_dir / "capture.hc22000"
-            result = subprocess.run([str(converter), "-o", str(hash_file), str(upload)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="replace", timeout=300)
-            (job_dir / "convert.log").write_text(result.stdout or "", encoding="utf-8")
-            if not hash_file.is_file() or hash_file.stat().st_size == 0:
-                raise RuntimeError("hcxpcapngtool produced no usable hashes: " +
-                                   clean((result.stdout or "")[-400:]))
+            converter = self.tools.get("hcxpcapngtool")
+            if converter is not None:
+                result = subprocess.run([str(converter), "-o", str(hash_file), str(upload)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, encoding="utf-8", errors="replace", timeout=300)
+                (job_dir / "convert.log").write_text(result.stdout or "", encoding="utf-8")
+            if converter is None or not hash_file.is_file() or hash_file.stat().st_size == 0:
+                (job_dir / "convert.log").write_text(
+                    "hcxpcapngtool unavailable or empty; using the built-in converter.\n",
+                    encoding="utf-8")
+                lines = extract_hc22000(upload)
+                if not lines:
+                    hint = "Make sure the capture holds an M1+M2 EAPOL handshake and a beacon " \
+                           "with the SSID (or a hidden SSID is recoverable)."
+                    raise RuntimeError("No usable WPA handshake found in the capture. " + hint)
+                hash_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         out_file = job_dir / "cracked.txt"
         command = build_hashcat_command(hashcat, hash_file, job["attack"], out_file,
                                         self.config.potfile, self.config,
@@ -2874,26 +3066,35 @@ def watch_job(client, job_id, tower_url):
 
 
 def prepare_capture(path):
-    """Convert .pcapng to .hc22000 on the laptop when hcxtools is available.
+    """Convert a raw capture to .hc22000 before uploading it.
 
-    hcxtools publishes no official Windows binary, so conversion normally
-    happens here. The tower still converts as a fallback if it has the tool.
+    Uses hcxtools when present and otherwise the built-in parser, so raw
+    captures work even without tshark/hcxpcapngtool (e.g. on the GPU box).
     """
     path = Path(path)
     if path.suffix.lower() == ".hc22000":
         return path
     converter = find_tool("hcxpcapngtool")
-    if converter is None:
-        print("hcxpcapngtool not found locally; sending the raw capture for the host to convert.")
-        return path
-    out = path.with_suffix(".hc22000")
-    result = subprocess.run([str(converter), "-o", str(out), str(path)],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if result.returncode or not out.is_file() or out.stat().st_size == 0:
-        print("Local conversion produced no hashes; sending the raw capture instead.")
+    if converter is not None:
+        out = path.with_suffix(".hc22000")
+        result = subprocess.run([str(converter), "-o", str(out), str(path)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8", errors="replace")
+        if result.returncode == 0 and out.is_file() and out.stat().st_size:
+            print(f"Converted locally: {out}")
+            return out
         out.unlink(missing_ok=True)
+    out = path.with_suffix(".hc22000")
+    try:
+        lines = extract_hc22000(path)
+    except OSError as exc:
+        print(f"Could not read the capture ({exc}); sending it as-is.")
         return path
-    print(f"Converted locally: {out}")
+    if not lines:
+        print("No usable WPA handshake (M1+M2 with SSID) found; sending the raw capture.")
+        return path
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Converted with the built-in parser: {out} ({len(lines)} handshake line(s))")
     return out
 
 
@@ -3123,6 +3324,22 @@ def self_test():
         assert config_none.max_upload_mb == 64 and config_none.job_timeout == 0
         parsed = build_parser().parse_args([])
         assert parsed.max_upload_mb == 64 and parsed.job_timeout == 0
+    # Built-in pcap -> hc22000 converter must work without tshark/hcxtools.
+    example = Path(__file__).resolve().parent / "test-captures" / \
+        "wnm_sleep_test-wpa2-psk:12345678.pcapng"
+    if example.is_file():
+        lines = extract_hc22000(example)
+        assert lines, "built-in converter found no handshake in the example capture"
+        parts = lines[0].split("*")
+        assert len(parts) == 9 and parts[0] == "WPA" and parts[1] == "02" and parts[8] == "00"
+        line_mic = bytes.fromhex(parts[2])
+        line_ap, line_sta = bytes.fromhex(parts[3]), bytes.fromhex(parts[4])
+        essid, anonce, eapol = bytes.fromhex(parts[5]), bytes.fromhex(parts[6]), bytes.fromhex(parts[7])
+        assert essid == b"test-wnm-rsn"
+        pmk = hashlib.pbkdf2_hmac("sha1", b"12345678", essid, 4096, 32)
+        kck = derive_ptk(pmk, line_ap, line_sta, anonce, eapol[17:49])[:16]
+        assert hmac.new(kck, eapol, hashlib.sha1).digest()[:16] == line_mic
+        print("Self-test: built-in pcap -> hc22000 converter verified on the example capture.")
     if not shutil.which("tshark"):
         print("Self-test passed (pure logic, tower protocol, attack building). "
               "tshark not found; skipping the offline packet test.")
