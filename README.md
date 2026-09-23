@@ -4,7 +4,7 @@ Passive WPA-Handshake-Aufnahme auf einem Linux-Laptop und GPU-Cracking auf einem
 Windows-Tower. Der Laptop greift den Handshake auf und schickt ihn über
 Tailscale an den Tower; der Tower knackt ihn mit `hashcat` auf der GPU und
 schickt das Ergebnis zurück. Bedient wird alles über ein schlankes
-Terminal-TUI (`tui.py`, Textual).
+Terminal-TUI (Textual) oder klassisch im Terminal (`--run-capture`).
 
 > Nur für Netze, die dir gehören oder für die du eine ausdrückliche Erlaubnis
 > hast. Ziel dieses Setups ist, das eigene Netz abzusichern.
@@ -30,8 +30,8 @@ Terminal-TUI (`tui.py`, Textual).
   Fingerprint-Pinning, zusätzlich durch Tailscale (WireGuard) verschlüsselt.
 * **Keine App-Authentifizierung**: das Tailnet ist die Vertrauensgrenze. Jedes
   Gerät im Tailnet darf Jobs starten. Mit Tailscale-ACLs einschränkbar.
-* **Eine Engine, ein TUI**: `wifi-handshake.py` ist die Engine,
-  `tui.py` ist die Oberfläche. Beides aus einem Repo startbar.
+* **Alles in einer Datei**: `wifi-handshake.py` enthält Engine und TUI. Die
+  Rolle (`-c/--client` oder `-h/--host`) wird über die Argumente gewählt.
 
 
 Alles steckt in **einer Datei**: `wifi-handshake.py`. Die Rolle (Capture-Client
@@ -85,33 +85,35 @@ pip install --user textual
 ```
 Prüfen ohne Radio/Sudo:
 ```
-python tui.py --self-test
+python wifi-handshake.py --self-test
 ```
 
 ---
 
-## 4. Benutzung (TUI)
+## 4. Rollen und Benutzung
 
-`tui.py` ist die Bedienoberfläche; sie läuft auf beiden Maschinen. Die Engine
-`wifi-handshake.py` wird importiert. Auf Windows bzw. Linux unterscheidet sich
-nur, welche Screens sinnvoll sind.
+`wifi-handshake.py` startet standardmäßig die TUI; die Rolle wählst du mit
+`-c/--client` (Capture-Laptop) oder `-h/--host` (GPU-Tower). Ohne Rolle läuft
+die Datei auf jedem System als kombinierte TUI und zeigt nur die passenden
+Screens. Capture (`--run-capture`) funktioniert klassisch ohne TUI und nur
+unter Linux.
 
-### Starten
+### Starten (TUI)
 
 **Tower (Windows/GPU):**
 ```
-python tui.py --port 8443
+python wifi-handshake.py -h --port 8443
 ```
 **Laptop (Linux):**
 ```
-python tui.py --tower https://tower:8443
+python wifi-handshake.py -c --tower https://tower:8443
 ```
 Optionen:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
 `--serve` (öffnet den Server-Screen), `--self-test`.
 
-Auf Linux startet sich das TUI für den Capture-Teil per `sudo` neu (wie die
-Engine es früher tat).
+Auf Linux startet sich die Capture-Logik per `sudo` neu (wie das TUI es früher
+tat).
 
 ### Menü und Tasten
 
@@ -295,10 +297,11 @@ Es wird **nichts automatisch gelöscht** (alles bleibt zur Nachvollziehbarkeit).
 
 ```
 Starten:
-  python tui.py                          # Menü
-  python tui.py --tower https://tower    # Tower vorbelegen
-  python tui.py --port 8443 --serve      # Server-Screen (GPU-Box)
-  python tui.py --self-test              # Engine-Tests, kein Radio
+  python wifi-handshake.py -c                          # Laptop (client)
+  python wifi-handshake.py -h --tower https://tower    # GPU-Box (host)
+  python wifi-handshake.py -h --port 8443 --serve      # Server-Screen
+  python wifi-handshake.py --self-test                 # Engine-Tests, kein Radio
+  python wifi-handshake.py --run-capture               # klassisch, ohne TUI (Linux)
 
 Tasten im Menü:
   c capture    Capture-Screen (Linux)

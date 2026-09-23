@@ -1468,7 +1468,7 @@ def remember_fingerprint(host, port, fingerprint):
 
 
 class TowerClient:
-    def __init__(self, url, fingerprint=None, insecure=False, timeout=60):
+    def __init__(self, url, fingerprint=None, insecure=False, timeout=60, confirm=None):
         parsed = urllib.parse.urlsplit(url if "://" in url else "https://" + url)
         self.scheme = parsed.scheme or "https"
         self.host = parsed.hostname or "localhost"
@@ -1476,6 +1476,10 @@ class TowerClient:
         self.timeout = timeout
         self.fingerprint = fingerprint
         self.insecure = insecure
+        self.confirm = confirm or (lambda digest: input(
+            f"Tower certificate fingerprint (sha256): {digest}\n"
+            "Trust this tower and remember it? Type YES: ").strip() == "YES")
+        self.last_fingerprint = None
 
     def base(self):
         return f"{self.host}:{self.port}"
@@ -1493,10 +1497,10 @@ class TowerClient:
         if not der:
             raise RuntimeError("Tower presented no certificate.")
         digest = hashlib.sha256(der).hexdigest()
+        self.last_fingerprint = digest
         expected = (self.fingerprint or known_fingerprint(self.host, self.port) or "").replace(":", "").lower()
         if not expected:
-            print(f"Tower certificate fingerprint (sha256): {digest}")
-            if input("Trust this tower and remember it? Type YES: ").strip() != "YES":
+            if not self.confirm(digest):
                 raise RuntimeError("Tower certificate not trusted.")
             remember_fingerprint(self.host, self.port, digest)
             return
@@ -1902,113 +1906,1004 @@ def self_test():
     print("No adapter changes, network access or radio capture performed.")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Capture dependencies on Arch:
-  sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
 
-The capture path performs no installs, deauthentication or injection. Cracking
-happens only on the tower (--serve), using hashcat on the GPU, and only for
-networks you own or have explicit permission to test. Signal strength is not a
-throughput test. Security labels are AP advertisements. Capture checks the
-EAPOL exchange, not the password or MIC validity. NetworkManager settings are
-restored on normal exit, Ctrl+C and SIGTERM; SIGKILL or power loss cannot.
+# ---------------------------------------------------------------------------
+# Platform support and TUI entry point.
+#
+# Roles: --client (capture + upload) and --host (serve + crack). Both work on
+# Linux, macOS and Windows 10/11. Only the passive monitor-mode capture itself
+# is Linux-only (iw/airodump-ng/tshark); macOS has no usable monitor capture
+# here, and Windows has none at all. Everything else is platform-neutral.
+# ---------------------------------------------------------------------------
 
-Tower usage (Windows/GPU box):
-  wifi-handshake.py --install-tools
-  wifi-handshake.py --serve --port 8443
-Client usage (Linux laptop):
-  wifi-handshake.py --tower https://tower:8443
-  wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
-  wifi-handshake.py --tower https://tower:8443 --watch <job-id>
-""")
-    parser.add_argument("--scan-seconds", type=int, default=20)
-    parser.add_argument("--band", choices=("bg", "a", "abg"), default="abg",
-                        help="scan 2.4 GHz, 5 GHz, or both; no 6 GHz support here")
-    parser.add_argument("--channels", type=parse_channel_list,
-                        help="scan only these enabled channels, e.g. 1,6,11 or 100")
-    parser.add_argument("--timeout", type=int, default=0, help="capture seconds; 0 waits indefinitely")
-    parser.add_argument("--max-mb", type=int, default=256, help="temporary capture size limit, default 256 MiB")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent,
-                        help="save beside this script unless overridden")
-    parser.add_argument("--handshake", choices=("m1m2", "m1m2m3m4"),
-                        help="required EAPOL messages; prompted when omitted")
-    parser.add_argument("--self-test", action="store_true", help="offline synthetic tests; no sudo or adapter access")
-    tower = parser.add_argument_group("tower (Windows/GPU box)")
-    tower.add_argument("--serve", action="store_true", help="run the tower cracking server")
-    tower.add_argument("--host", default="0.0.0.0", help="server bind address")
-    tower.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"server port, default {DEFAULT_PORT}")
-    tower.add_argument("--jobs-dir", type=Path, help="where jobs and results are stored")
-    tower.add_argument("--tools-dir", type=Path, help="folder holding hashcat/hcxpcapngtool")
-    tower.add_argument("--wordlist-dir", type=Path, action="append", dest="wordlist_dirs",
-                       help="wordlist folder; repeatable")
-    tower.add_argument("--rule-dir", type=Path, action="append", dest="rule_dirs",
-                       help="hashcat rule folder; repeatable")
-    tower.add_argument("--cert", type=Path, help="TLS certificate PEM")
-    tower.add_argument("--key", type=Path, help="TLS private key PEM")
-    tower.add_argument("--no-tls", action="store_true", help="serve plain HTTP (Tailscale still encrypts)")
-    tower.add_argument("--max-upload-mb", type=int, default=64, help="maximum capture upload size")
-    tower.add_argument("--job-timeout", type=int, default=0, help="unused; jobs run to completion")
-    tower.add_argument("--install-tools", action="store_true", help="download and verify hashcat")
-    client = parser.add_argument_group("client (Linux laptop)")
-    client.add_argument("--tower", help="tower base URL, e.g. https://tower:8443")
-    client.add_argument("--send", type=Path, help="send this capture instead of capturing")
-    client.add_argument("--watch", help="reattach to an existing job id")
-    client.add_argument("--attack", type=Path, help="JSON file with attack parameters")
-    client.add_argument("--fingerprint", help="pinned tower certificate sha256 fingerprint")
-    client.add_argument("--insecure", action="store_true", help="skip tower certificate pinning")
-    args = parser.parse_args()
-
-    if args.self_test:
-        self_test()
-        return 0
-    if args.install_tools:
-        return install_tools(args.tools_dir)
-    if args.serve:
-        return serve(args)
-    if args.watch:
-        if not args.tower:
-            parser.error("--watch requires --tower URL")
-        return reattach(args)
-    if args.send:
-        if not args.tower:
-            parser.error("--send requires --tower URL")
-        return send_capture(args)
+def platform_name():
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
     if os.name == "nt":
-        raise RuntimeError("Live capture needs Linux (iw/airodump-ng/tshark). On Windows use "
-                           "--serve, --install-tools, --send or --watch.")
+        return "windows"
+    return sys.platform
 
+
+def capture_supported():
+    return platform_name() == "linux"
+
+
+def default_bind():
+    return "0.0.0.0"
+
+
+def run_tui(args):
+    app = HandshakeTUI(tower_url=args.tower, tools_dir=args.tools_dir,
+                       output_dir=args.output_dir, port=args.port,
+                       insecure=args.insecure, role="host" if args.host else ("client" if args.client else None),
+                       bind=args.bind)
+    if args.serve:
+        app.start_server_on_mount = True
+    app.run()
+    return 0
+
+
+
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import (
+    Button, DataTable, Footer, Header, Input, Label, ListItem, ListView,
+    OptionList, RichLog, Static,
+)
+from textual.widgets.option_list import Option
+
+
+
+PLAIN_CSS = """
+Screen {
+    background: $surface;
+}
+#menu {
+    dock: top;
+    height: 1;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+}
+#log {
+    height: 1fr;
+    border: none;
+    padding: 0 1;
+}
+#prompt {
+    dock: bottom;
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+}
+ListView {
+    height: 1fr;
+    border: none;
+}
+DataTable {
+    height: 1fr;
+}
+.panel {
+    height: auto;
+    padding: 0 1;
+}
+"""
+
+
+def plain_row(job):
+    """One status line, matching the CLI's print_job_line."""
+    gpu = job.get("gpu") or {}
+    parts = [job.get("state", "?")]
+    if job.get("progress") is not None:
+        parts.append(f"{job['progress']:.1f}%")
+    if job.get("hash_rate"):
+        parts.append(job["hash_rate"])
+    if gpu.get("temp") is not None:
+        parts.append(f"{gpu['temp']}C")
+    if gpu.get("util") is not None:
+        parts.append(f"util {gpu['util']}%")
+    if job.get("eta"):
+        parts.append(f"ETA {job['eta']}")
+    if job.get("candidate"):
+        parts.append(job["candidate"])
+    if job.get("recovered"):
+        parts.append(f"recovered {job['recovered']}")
+    return " | ".join(parts)
+
+
+class PromptScreen(Screen):
+    """Base screen: title bar, scrollable log and a one-line prompt."""
+
+    TITLE = "wifi-handshake"
+
+    def __init__(self, app):
+        super().__init__()
+        self.app_ref = app
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", markup=True, wrap=True, highlight=False)
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        prompt = self.query_one("#prompt", Static)
+        prompt.update(f"[dim]{self.app_ref.status_line()}[/dim]")
+        self.query_one("#log", RichLog).can_focus = False
+
+    def log_line(self, message: str) -> None:
+        self.query_one("#log", RichLog).write(message)
+
+    def set_prompt(self, message: str) -> None:
+        self.query_one("#prompt", Static).update(message)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        handler = getattr(self, f"on_choice_{event.item.id}", None)
+        if handler:
+            handler()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        handler = getattr(self, f"on_choice_{event.button.id}", None)
+        if handler:
+            handler()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        handler = getattr(self, f"on_choice_{event.option.id}", None)
+        if handler:
+            handler()
+
+
+class MenuScreen(PromptScreen):
+    TITLE = "wifi-handshake / menu"
+    BINDINGS = [
+        Binding("c", "capture", "capture"),
+        Binding("t", "tower", "tower status"),
+        Binding("j", "jobs", "jobs"),
+        Binding("s", "setup", "setup"),
+        Binding("q", "quit", "quit"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", markup=True, wrap=True, highlight=False)
+        yield ListView(id="choices")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt", Static).update(
+            self.app_ref.status_line() + "\n[dim]enter select | c capture | t tower | j jobs | s setup | q quit[/dim]"
+        )
+        view = self.query_one("#choices", ListView)
+        view.append(ListItem(Label("Capture a handshake and crack it on the tower"), id="capture"))
+        view.append(ListItem(Label("Tower status and connection test"), id="tower"))
+        view.append(ListItem(Label("Jobs: queue, history, reattach"), id="jobs"))
+        view.append(ListItem(Label("Setup / diagnose this machine"), id="setup"))
+        view.append(ListItem(Label("Quit"), id="quit"))
+        if not self.app_ref.engine_is_linux():
+            self.log_line("[yellow]Live capture needs Linux. On Windows use Setup and Tower.[/yellow]")
+
+    def on_choice_capture(self):
+        if self.app_ref.engine_is_linux():
+            self.app.push_screen(CaptureScreen(self.app_ref))
+        else:
+            self.log_line("[yellow]Capture is Linux-only; falling back to sending a file.[/yellow]")
+            self.app.push_screen(AttackScreen(self.app_ref, None))
+
+    def on_choice_tower(self):
+        self.app.push_screen(TowerScreen(self.app_ref))
+
+    def on_choice_jobs(self):
+        self.app.push_screen(JobsScreen(self.app_ref))
+
+    def on_choice_setup(self):
+        self.app.push_screen(SetupScreen(self.app_ref))
+
+    def on_choice_quit(self):
+        self.app.exit()
+
+    def action_capture(self):
+        self.on_choice_capture()
+
+    def action_tower(self):
+        self.on_choice_tower()
+
+    def action_jobs(self):
+        self.on_choice_jobs()
+
+    def action_setup(self):
+        self.on_choice_setup()
+
+    def action_quit(self):
+        self.on_choice_quit()
+
+
+class TowerScreen(PromptScreen):
+    TITLE = "wifi-handshake / tower"
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        with Vertical(classes="panel"):
+            yield Label("Tower URL (host:port)")
+            yield Input(value=self.app_ref.tower_url or "https://tower:8443", id="tower-url")
+            with Horizontal():
+                yield Button("Connect", id="connect", variant="primary")
+                yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        self.log_line("Enter the tower URL, then Connect. First contact prints the certificate fingerprint.")
+
+    def on_choice_back(self):
+        self.app.pop_screen()
+
+    def on_choice_connect(self):
+        self.app_ref.tower_url = self.query_one("#tower-url", Input).value.strip()
+        self.set_prompt("Contacting tower...")
+        self.fetch_health(self.app_ref.tower_url)
+
+    @work(thread=True, exclusive=True)
+    def fetch_health(self, url: str) -> None:
+        try:
+            client = TowerClient(url, insecure=self.app_ref.insecure)
+            health = client.health() or {}
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]Connection failed: {clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.set_prompt, "Connection failed.")
+            return
+        lines = [f"protocol {health.get('protocol')} on {health.get('os')}",
+                 f"hashcat: {health.get('hashcat_version')} ({health.get('hashcat')})",
+                 f"hcxpcapngtool: {health.get('hcxpcapngtool')}",
+                 f"backend: {health.get('backend') or 'auto'}",
+                 f"queue: {health.get('queue')}"]
+        for device in health.get("devices", []):
+            lines.append("  " + device)
+        for line in lines:
+            self.app.call_from_thread(self.log_line, line)
+        self.app.call_from_thread(self.set_prompt, "Connected.")
+        remembered = known_fingerprint(client.host, client.port)
+        if remembered:
+            self.app.call_from_thread(self.log_line, f"pinned fingerprint: {remembered[:32]}...")
+        self.app_ref.remember_tower(url)
+
+
+class SetupScreen(PromptScreen):
+    TITLE = "wifi-handshake / setup"
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        with Horizontal(classes="panel"):
+            yield Button("Diagnose", id="diagnose", variant="primary")
+            yield Button("Install hashcat", id="install")
+            yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        self.log_line("Diagnose checks this machine and the pinned tools. Nothing is changed.")
+        normal = "normal" if sys.stdin.isatty() else "no tty"
+        self.log_line(f"platform: {sys.platform} | python: {sys.version.split()[0]} | {normal}")
+        for tool in ("hashcat", "hcxpcapngtool", "tshark", "iw", "airodump-ng"):
+            found = find_tool(tool, [default_tools_dir()])
+            self.log_line(f"{tool}: {found if found else '[yellow]not found[/yellow]'}")
+
+    def on_choice_back(self):
+        self.app.pop_screen()
+
+    def on_choice_install(self):
+        self.set_prompt("Downloading hashcat...")
+        self.install(self.app_ref.tools_dir or default_tools_dir())
+
+    @work(thread=True, exclusive=True)
+    def install(self, tools_dir) -> None:
+        try:
+            install_tools(tools_dir)
+            backend = discover_tools(TowerConfig(
+                "127.0.0.1", 8443, app_dir() / "jobs", tools_dir,
+                [app_dir() / "wordlists"], []))
+            summary = backend_summary(backend.get("backends") or {})
+            self.app.call_from_thread(self.log_line, f"backend: {backend.get('backend') or 'none'}")
+            for line in summary:
+                self.app.call_from_thread(self.log_line, "  " + line)
+            self.app.call_from_thread(self.set_prompt, "Install finished.")
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.set_prompt, "Install failed.")
+
+    def on_choice_diagnose(self):
+        self.log_line("hashcat backends:")
+        hashcat = find_tool("hashcat", [default_tools_dir()])
+        for line in backend_summary(detect_backends(hashcat)):
+            self.log_line("  " + line)
+
+
+class CaptureScreen(PromptScreen):
+    TITLE = "wifi-handshake / capture"
+    BINDINGS = [Binding("escape", "back", "back")]
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        yield ListView(id="choices")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        self.messages = (1, 2)
+        self.adapter = None
+        self.state = "messages"
+        self.query_one("#prompt", Static).update(
+            "EAPOL messages: [1] M1+M2 only (enough for hashcat) | [2] M1+M2+M3+M4"
+        )
+        view = self.query_one("#choices", ListView)
+        view.append(ListItem(Label("M1+M2 only (fast; enough for hashcat -m 22000)"), id="m12"))
+        view.append(ListItem(Label("M1+M2+M3+M4 (full four-way exchange)"), id="m1234"))
+
+    def on_choice_m12(self):
+        self.messages = (1, 2)
+        self.begin_adapters()
+
+    def on_choice_m1234(self):
+        self.messages = (1, 2, 3, 4)
+        self.begin_adapters()
+
+    def begin_adapters(self):
+        self.state = "adapters"
+        self.log_line(f"required messages: {'+'.join('M%d' % m for m in self.messages)}")
+        try:
+            available = adapters()
+        except (RuntimeError, OSError) as exc:
+            self.log_line(f"[red]{clean(str(exc))}[/red]")
+            return
+        if not available:
+            self.log_line("[red]No wireless interfaces found.[/red]")
+            return
+        self.set_prompt("Select a monitor-capable adapter (a dedicated radio).")
+        view = self.query_one("#choices", ListView)
+        view.clear()
+        self._adapters = available
+        for name, phy in available:
+            view.append(ListItem(Label(f"{name} [{phy}]"), id=f"adapter::{name}::{phy}"))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item_id = event.item.id or ""
+        if item_id.startswith("adapter::"):
+            _, name, phy = item_id.split("::")
+            self.select_adapter(name, phy)
+        elif item_id.startswith("network::"):
+            self.select_network(int(item_id.split("::")[1]))
+
+    def select_adapter(self, name, phy):
+        try:
+            adapter = Adapter(name, phy)
+        except (RuntimeError, OSError) as exc:
+            self.log_line(f"[red]{clean(str(exc))}[/red]")
+            return
+        siblings = [other for other, p in self._adapters if p == phy and other != name]
+        if siblings:
+            self.log_line(f"[red]Other interfaces share this radio: {', '.join(siblings)}. "
+                     "Use a dedicated radio.[/red]")
+            return
+        self.adapter = adapter
+        self.log_line(f"adapter: {name} (managed, was {adapter.original_type})")
+        self.log_line("[yellow]This disconnects the laptop from Wi-Fi while monitoring.[/yellow]")
+        self.log_line("Only use this on a network you own or have explicit permission to test.")
+        self.state = "confirm"
+        self.set_prompt("Press y to enable monitor mode and scan, n to go back.")
+        self.query_one("#choices", ListView).clear()
+
+    def key_y(self):
+        if self.state == "confirm":
+            self.run_scan()
+
+    def key_n(self):
+        if self.state == "confirm":
+            self.action_back()
+
+    @work(thread=True, exclusive=True)
+    def run_scan(self):
+        try:
+            self.app.call_from_thread(self.set_prompt, "Enabling monitor mode...")
+            self.adapter.enable()
+            self.app.call_from_thread(self.log_line, "adapter in monitor mode")
+            self._networks = self.scan_and_list()
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.set_prompt, "Error. Press escape to restore.")
+            self.app.call_from_thread(self.restore_if_needed)
+
+    def scan_and_list(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="wifi-tui-") as tmp:
+            directory = Path(tmp)
+            self._tmp = directory
+            networks = scan(self.adapter, directory, 20, "abg", None)
+        self.app.call_from_thread(self.show_networks, networks)
+        return networks
+
+    def show_networks(self, networks):
+        self.state = "networks"
+        if not networks:
+            self.log_line("[yellow]No networks found.[/yellow]")
+            return
+        self.log_line(f"{len(networks)} networks found:")
+        view = self.query_one("#choices", ListView)
+        view.clear()
+        self._networks = networks
+        for index, net in enumerate(networks):
+            power = f"{net['power']} dBm" if net["power"] < -1 else "unknown"
+            label = (f"{net['ssid']}  {net['bssid']}  ch {net['channel']}  "
+                     f"{power}  {net['security']}")
+            view.append(ListItem(Label(label), id=f"network::{index}"))
+        self.set_prompt("Select the network to capture. Signal is received power, not throughput.")
+
+    def select_network(self, index):
+        network = self._networks[index]
+        if not any(wpa in network["security"].upper() for wpa in ("WPA", "RSN")):
+            self.log_line("[yellow]That network does not advertise WPA/RSN; no WPA handshake to capture.[/yellow]")
+            return
+        self.target = network
+        self.log_line(f"target: {network['ssid']} [{network['bssid']}] channel {network['channel']}")
+        self.set_prompt("Waiting for a matching EAPOL exchange. A device must reconnect. q cancels.")
+        self.wait_for_handshake(self.app_ref.output_dir)
+
+    @work(thread=True, exclusive=True)
+    def wait_for_handshake(self, output_dir):
+        try:
+            result = capture(self.adapter, self.target, self._tmp, 0, 256, self.messages)
+        except (RuntimeError, OSError, Exception) as exc:  # noqa: BLE001 - surface anything
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.restore_if_needed)
+            return
+        if result is None:
+            self.app.call_from_thread(self.log_line, "Capture ended without a matching exchange.")
+            self.app.call_from_thread(self.restore_if_needed)
+            return
+        raw, frames = result
+        prefix = time.strftime("handshake-%Y%m%d-%H%M%S-") + self.target["bssid"].replace(":", "") + "-"
+        out = Path(output_dir) / (prefix + ".pcapng")
+        try:
+            save_capture(raw, frames, self.target, out)
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]Save failed: {clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.restore_if_needed)
+            return
+        names = "+".join(f"M{m}" for m in self.messages)
+        self.app.call_from_thread(self.log_line, f"[green]Captured {names} for client "
+                                 f"{frames[0]['client']}[/green]")
+        self.app.call_from_thread(self.log_line, f"saved: {out}")
+        self.app.call_from_thread(self.restore_if_needed)
+        self.app.call_from_thread(self.offer_submit, out)
+
+    def offer_submit(self, path):
+        if not self.app_ref.tower_url:
+            self.set_prompt("Saved. No tower configured; set one in Tower, then use --send.")
+            return
+        self.state = "submit"
+        self.set_prompt("Press t to submit to the tower, or escape to keep the file local.")
+        self._capture_path = path
+
+    def key_t(self):
+        if self.state == "submit":
+            self.app.switch_screen(AttackScreen(self.app_ref, self._capture_path))
+
+    def restore_if_needed(self):
+        if self.adapter is not None:
+            try:
+                self.adapter.restore()
+            except Exception as exc:  # noqa: BLE001
+                self.log_line(f"[yellow]Restore warning: {clean(str(exc))}[/yellow]")
+            self.adapter = None
+        self.set_prompt("Adapter restored. escape to go back.")
+
+    def action_back(self):
+        self.restore_if_needed()
+        self.app.pop_screen()
+
+
+class AttackScreen(PromptScreen):
+    TITLE = "wifi-handshake / attack"
+    BINDINGS = [Binding("escape", "back", "back")]
+
+    def __init__(self, app, capture_path):
+        super().__init__(app)
+        self.capture_path = capture_path
+        self.attack = {}
+        self.wordlists = []
+        self.rules = []
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        with Vertical(classes="panel"):
+            yield Input(placeholder="capture file (.pcapng/.hc22000), empty = last capture", id="capture")
+            yield Input(placeholder="mask, e.g. ?d?d?d?d?d?d?d?d", id="mask")
+            yield Label("Wordlist (blank for none)")
+            yield OptionList(id="wordlists")
+            yield Label("Rules (blank for none)")
+            yield OptionList(id="rules")
+            with Horizontal():
+                yield Button("Submit", id="submit", variant="primary")
+                yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        if self.capture_path:
+            self.query_one("#capture", Input).value = str(self.capture_path)
+        self.set_prompt("Pick wordlist/rules, set a mask if needed, then Submit.")
+        if self.app_ref.tower_url:
+            self.load_listing()
+        else:
+            self.log_line("[yellow]No tower set. Open Tower and connect, then reopen this screen.[/yellow]")
+
+    @work(thread=True, exclusive=True)
+    def load_listing(self):
+        try:
+            client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+            listing = client.wordlists() or {}
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.log_line, "Tower unreachable; fill the fields manually.")
+            return
+        self.app.call_from_thread(self.fill, listing)
+
+    def fill(self, listing):
+        listing = listing or {}
+        self.wordlists = listing.get("wordlists") or []
+        self.rules = listing.get("rules") or []
+        wordlist_view = self.query_one("#wordlists", OptionList)
+        wordlist_view.clear_options()
+        for item in self.wordlists:
+            wordlist_view.add_option(Option(f"{item['name']} ({item['size']} bytes)", id=f"wl::{item['name']}"))
+        rule_view = self.query_one("#rules", OptionList)
+        rule_view.clear_options()
+        for item in self.rules:
+            rule_view.add_option(Option(item["name"], id=f"rule::{item['name']}"))
+        self.log_line(f"tower lists {len(self.wordlists)} wordlists and {len(self.rules)} rules")
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        option_id = event.option.id or ""
+        if option_id.startswith("wl::"):
+            self.attack["wordlist"] = option_id.split("::", 1)[1]
+            self.log_line(f"wordlist: {self.attack['wordlist']}")
+        elif option_id.startswith("rule::"):
+            self.attack.setdefault("rules", [])
+            rule = option_id.split("::", 1)[1]
+            if rule in self.attack["rules"]:
+                self.attack["rules"].remove(rule)
+            else:
+                self.attack["rules"].append(rule)
+            self.log_line("rules: " + (", ".join(self.attack["rules"]) or "none"))
+
+    def on_choice_back(self):
+        self.app.pop_screen()
+
+    def on_choice_submit(self):
+        capture = self.query_one("#capture", Input).value.strip() or self.capture_path
+        if not capture:
+            self.log_line("[red]No capture file given.[/red]")
+            return
+        mask = self.query_one("#mask", Input).value.strip()
+        attack = dict(self.attack)
+        if attack.get("wordlist") and mask:
+            attack["type"] = "hybrid"
+            attack["mask"] = mask
+            attack["order"] = "wordlist-first"
+        elif mask:
+            attack["type"] = "mask"
+            attack["mask"] = mask
+        elif attack.get("wordlist"):
+            attack["type"] = "dictionary"
+        else:
+            self.log_line("[red]Choose a wordlist or a mask.[/red]")
+            return
+        self.log_line("attack: " + str(attack))
+        self.submit(capture, attack)
+
+    @work(thread=True, exclusive=True)
+    def submit(self, capture, attack):
+        self.app.call_from_thread(self.set_prompt, "Uploading...")
+        try:
+            client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+            capture = prepare_capture(capture)
+            job_id = client.create_job(capture, attack)["job_id"]
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            self.app.call_from_thread(self.set_prompt, "Submit failed.")
+            return
+        self.app.call_from_thread(self.log_line, f"[green]job queued: {job_id}[/green]")
+        self.app.call_from_thread(self.app.switch_screen, CrackScreen(self.app_ref, job_id))
+
+
+class CrackScreen(PromptScreen):
+    TITLE = "wifi-handshake / crack"
+    BINDINGS = [Binding("escape", "back", "back")]
+
+    def __init__(self, app, job_id):
+        super().__init__(app)
+        self.job_id = job_id
+        self.last_line = None
+        self.finished = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        with Horizontal(classes="panel"):
+            yield Button("Cancel job", id="cancel")
+            yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        self.log_line(f"job {self.job_id}")
+        self.set_prompt("Connecting to the live status stream...")
+        if self.app_ref.tower_url:
+            self.stream()
+        else:
+            self.set_prompt("No tower set.")
+            self.log_line("[yellow]No tower set.[/yellow]")
+
+    @work(thread=True, exclusive=True)
+    def stream(self):
+        client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+        started = self.live_capture_helpers()
+        self.app.call_from_thread(self.set_prompt, "Live status (WebSocket, polling fallback).")
+        client.stream_events(self.job_id, started)
+        self.poll_fallback(client)
+
+    def live_capture_helpers(self):
+        def on_status(job):
+            self.app.call_from_thread(self.apply_status, job)
+        return on_status
+
+    def apply_status(self, job):
+        line = plain_row(job)
+        if line != self.last_line:
+            self.last_line = line
+            self.log_line(line)
+        if job.get("state") in ("done", "failed", "cancelled"):
+            self.finished = True
+            self.report(job)
+
+    def poll_fallback(self, client):
+        while not self.finished:
+            try:
+                job = client.job(self.job_id)
+            except (RuntimeError, OSError) as exc:
+                self.app.call_from_thread(self.log_line, f"[yellow]poll error: {clean(str(exc))}[/yellow]")
+                time.sleep(3)
+                continue
+            self.app.call_from_thread(self.apply_status, job)
+            if job.get("state") in ("done", "failed", "cancelled"):
+                return
+            time.sleep(3)
+
+    def report(self, job):
+        result = job.get("result") or {}
+        if job["state"] == "failed":
+            self.log_line(f"[red]tower error: {clean(str(job.get('error')))}[/red]")
+            self.set_prompt("Failed. escape to go back.")
+        elif result.get("found"):
+            self.log_line(f"[green]Password found: {result['password']}[/green]")
+            self.set_prompt("Done. escape to go back.")
+        else:
+            self.log_line("Password not found with this attack.")
+            self.set_prompt("Done (not found). escape to go back.")
+
+    def on_choice_cancel(self):
+        self.cancel(self.job_id)
+
+    @work(thread=True, exclusive=True)
+    def cancel(self, job_id):
+        try:
+            client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+            client.request("DELETE", f"/api/v1/jobs/{job_id}")
+            self.app.call_from_thread(self.log_line, "cancel requested")
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+
+    def on_choice_back(self):
+        self.app.pop_screen()
+
+    def action_back(self):
+        self.app.pop_screen()
+
+
+class JobsScreen(PromptScreen):
+    TITLE = "wifi-handshake / jobs"
+    BINDINGS = [Binding("escape", "back", "back")]
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        yield DataTable(id="jobs")
+        with Horizontal(classes="panel"):
+            yield Button("Refresh", id="refresh", variant="primary")
+            yield Button("Watch selected", id="watch")
+            yield Button("Cancel selected", id="cancel")
+            yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        table = self.query_one("#jobs", DataTable)
+        table.add_columns("job", "state", "progress", "hash rate", "result")
+        table.cursor_type = "row"
+        self.jobs = []
+        if self.app_ref.tower_url:
+            self.refresh_jobs()
+        else:
+            self.set_prompt("No tower set. Open Tower and connect first.")
+            self.log_line("[yellow]No tower set.[/yellow]")
+
+    def on_choice_back(self):
+        self.app.pop_screen()
+
+    def action_back(self):
+        self.app.pop_screen()
+
+    def on_choice_refresh(self):
+        self.refresh_jobs()
+
+    @work(thread=True, exclusive=True)
+    def refresh_jobs(self):
+        try:
+            client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+            jobs = client.request("GET", "/api/v1/jobs").get("jobs") or []
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+            return
+        self.app.call_from_thread(self.show_jobs, jobs)
+
+    def show_jobs(self, jobs):
+        self.jobs = jobs
+        table = self.query_one("#jobs", DataTable)
+        table.clear()
+        for job in jobs:
+            result = job.get("result") or {}
+            if result.get("found"):
+                shown = result.get("password", "")
+            elif job.get("error"):
+                shown = "error"
+            else:
+                shown = "-"
+            table.add_row(job["id"], job.get("state", "?"),
+                          f"{job.get('progress') or 0:.1f}%",
+                          job.get("hash_rate") or "-", shown)
+        self.set_prompt(f"{len(jobs)} jobs.")
+
+    def selected_job(self):
+        table = self.query_one("#jobs", DataTable)
+        if table.cursor_row < 0 or table.cursor_row >= len(self.jobs):
+            return None
+        return self.jobs[table.cursor_row]
+
+    def on_choice_watch(self):
+        job = self.selected_job()
+        if job:
+            self.app.switch_screen(CrackScreen(self.app_ref, job["id"]))
+
+    def on_choice_cancel(self):
+        job = self.selected_job()
+        if job:
+            self.cancel(job["id"])
+
+    @work(thread=True, exclusive=True)
+    def cancel(self, job_id):
+        try:
+            client = TowerClient(self.app_ref.tower_url, insecure=self.app_ref.insecure)
+            client.request("DELETE", f"/api/v1/jobs/{job_id}")
+            self.app.call_from_thread(self.log_line, f"cancelled {job_id}")
+            self.app.call_from_thread(self.refresh_jobs)
+        except (RuntimeError, OSError) as exc:
+            self.app.call_from_thread(self.log_line, f"[red]{clean(str(exc))}[/red]")
+
+
+class ServerScreen(PromptScreen):
+    """Start the tower server in-process. Kept for the Windows/GPU machine."""
+
+    TITLE = "wifi-handshake / serve"
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.TITLE, id="menu")
+        yield RichLog(id="log", wrap=True, highlight=False)
+        with Horizontal(classes="panel"):
+            yield Button("Start server", id="start", variant="primary")
+            yield Button("Stop", id="stop")
+            yield Button("Back", id="back")
+        yield Static("", id="prompt")
+        yield Footer()
+
+    def on_mount(self):
+        self.server = None
+        self.worker = None
+        self.log_line("Starts the tower server on this machine (the GPU box).")
+
+    def on_choice_back(self):
+        self.action_back()
+
+    def action_back(self):
+        self.stop_server()
+        self.app.pop_screen()
+
+    def on_choice_start(self):
+        config = TowerConfig(
+            "0.0.0.0", self.app_ref.port, app_dir() / "jobs",
+            self.app_ref.tools_dir or default_tools_dir(),
+            [app_dir() / "wordlists"], [])
+        for directory in config.wordlist_dirs:
+            directory.mkdir(parents=True, exist_ok=True)
+        tools = discover_tools(config)
+        store = JobStore(config.jobs_dir)
+        self.worker = TowerWorker(store, config, tools)
+        self.worker.start()
+        self.server = TowerServer(("0.0.0.0", self.app_ref.port), TowerHandler)
+        self.server.store, self.server.config, self.server.tools = store, config, tools
+        context = ensure_server_context(config)
+        if context:
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        import threading
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        scheme = "https" if context else "http"
+        self.log_line(f"[green]{scheme}://0.0.0.0:{self.app_ref.port} listening[/green]")
+        self.log_line(f"backend: {tools.get('backend') or 'none'}")
+        for line in backend_summary(tools.get("backends") or {}):
+            self.log_line("  " + line)
+
+    def on_choice_stop(self):
+        self.stop_server()
+
+    def stop_server(self):
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker = None
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+            self.log_line("server stopped")
+
+
+class HandshakeTUI(App):
+    CSS = PLAIN_CSS
+    BINDINGS = [Binding("ctrl+q", "quit", "quit", show=False)]
+
+    def __init__(self, tower_url=None, tools_dir=None, output_dir=None,
+                 port=DEFAULT_PORT, insecure=False, role=None, bind=None):
+        super().__init__()
+        self.tower_url = tower_url
+        self.tools_dir = tools_dir
+        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.port = port
+        self.insecure = insecure
+        self.role = role
+        self.bind = bind or default_bind()
+        self.start_server_on_mount = False
+        self.last_fingerprint = None
+        self.screens_stack = []
+
+    def engine_is_linux(self):
+        return capture_supported()
+
+    def platform(self):
+        return platform_name()
+
+    def status_line(self):
+        tower = self.tower_url or "no tower set"
+        role = self.role or ("host" if self.platform() != "linux" else "client")
+        return (f"[bold]wifi-handshake[/bold] | {self.platform()} | role: {role} | "
+                f"tower: {tower}")
+
+    def confirm_certificate(self, digest):
+        # Runs in a worker thread; the TUI cannot block on input. Trust on first
+        # use and remember it so later connections are pinned.
+        return True
+
+    def remember_tower(self, url):
+        self.tower_url = url
+        parsed = urllib.parse.urlsplit(url if "://" in url else "https://" + url)
+        if parsed.hostname and self.last_fingerprint:
+            remember_fingerprint(parsed.hostname, parsed.port or 443, self.last_fingerprint)
+
+    def on_mount(self):
+        self.push_screen(MenuScreen(self))
+        if self.start_server_on_mount:
+            self.push_screen(ServerScreen(self))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="wifi-handshake",
+        description="Passive Wi-Fi handshake capture and tower GPU cracking. "
+                    "Choose the role with --client or --host.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,
+        epilog="""Examples:
+  python wifi-handshake.py --client                 # capture laptop (client)
+  python wifi-handshake.py --host                   # GPU tower (host)
+  python wifi-handshake.py --client --tower URL
+  python wifi-handshake.py --host --port 8443
+  python wifi-handshake.py --self-test
+  python wifi-handshake.py --host --install-tools
+
+Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the host
+role and the client/upload role work on every platform. Capture dependencies
+on Arch:
+  sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
+  pip install --user textual
+
+No deauthentication, injection or radio interference anywhere in this tool.
+Only test networks you own or have permission to test.
+""")
+    role = parser.add_mutually_exclusive_group()
+    role.add_argument("-c", "--client", action="store_true",
+                      help="run as the capture client (laptop)")
+    role.add_argument("-h", "--host", action="store_true",
+                      help="run as the tower host (GPU box)")
+    parser.add_argument("--help", "-?", action="help",
+                        help="show this help message and exit")
+
+    parser.add_argument("--tower", help="tower base URL, e.g. https://tower:8443")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"tower port, default {DEFAULT_PORT}")
+    parser.add_argument("--bind", default="0.0.0.0", help="server bind address, default 0.0.0.0")
+    parser.add_argument("--tools-dir", type=Path, help="folder holding hashcat")
+    parser.add_argument("--output-dir", type=Path, help="where captures are saved")
+    parser.add_argument("--insecure", action="store_true", help="skip certificate pinning")
+    parser.add_argument("--serve", action="store_true", help="start the tower server from the TUI")
+    parser.add_argument("--install-tools", action="store_true", help="download, verify and unpack hashcat")
+    parser.add_argument("--self-test", action="store_true", help="run offline tests and exit")
+
+    capture = parser.add_argument_group("non-interactive capture (Linux, no TUI)")
+    capture.add_argument("--run-capture", action="store_true", help="capture without the TUI")
+    capture.add_argument("--handshake", choices=("m1m2", "m1m2m3m4"), help="required EAPOL messages")
+    capture.add_argument("--scan-seconds", type=int, default=20)
+    capture.add_argument("--band", choices=("bg", "a", "abg"), default="abg")
+    capture.add_argument("--channels", type=parse_channel_list, help="e.g. 1,6,11 or 100")
+    capture.add_argument("--timeout", type=int, default=0, help="capture seconds; 0 waits indefinitely")
+    capture.add_argument("--max-mb", type=int, default=256, help="temporary capture size limit")
+
+    headless = parser.add_argument_group("non-interactive client (no TUI)")
+    headless.add_argument("--send", type=Path, help="send this capture instead of capturing")
+    headless.add_argument("--watch", help="reattach to an existing job id")
+    headless.add_argument("--attack", type=Path, help="JSON file with attack parameters")
+    headless.add_argument("--fingerprint", help="pinned tower certificate sha256 fingerprint")
+    return parser
+
+
+def run_capture_cli(args):
+    if not capture_supported():
+        raise RuntimeError("Live capture needs Linux (iw/airodump-ng/tshark). "
+                           "On other systems use --host or --send/--watch.")
     if args.scan_seconds < 3 or args.timeout < 0 or args.max_mb < 1:
-        parser.error("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
+        raise RuntimeError("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
     if not sys.stdin.isatty():
-        parser.error("Run in an interactive terminal for sudo and the menus.")
-    if os.geteuid() != 0:
+        raise RuntimeError("Run in an interactive terminal for sudo and the menus.")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
         if not shutil.which("sudo"):
             raise RuntimeError("sudo is required. Alternatively run this script as root.")
         os.execvp("sudo", ["sudo", "--", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
-    # Use standard system utilities, not executables inherited through sudo PATH.
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
     os.environ["LC_ALL"] = "C"
     os.umask(0o077)
     missing = [c for c in ("iw", "ip", "airodump-ng", "tshark") if not shutil.which(c)]
     if missing:
-        raise RuntimeError("Missing local tools: " + ", ".join(missing) + ". See --help. Nothing was installed.")
-    # Check dissector compatibility before taking Wi-Fi offline.
+        raise RuntimeError("Missing local tools: " + ", ".join(missing) + ". Nothing was installed.")
     fields = run("tshark", "-G", "fields").stdout
     if any("\t" + field + "\t" not in fields for field in FIELDS):
         raise RuntimeError("This tshark build is missing required Wi-Fi/EAPOL fields.")
-    output_dir = args.output_dir.resolve()
+    output_dir = (args.output_dir or Path(__file__).resolve().parent).resolve()
     if not output_dir.is_dir():
         raise RuntimeError(f"Output directory does not exist: {output_dir}")
-
-    if args.handshake:
-        messages = {"m1m2": (1, 2), "m1m2m3m4": (1, 2, 3, 4)}[args.handshake]
-    else:
-        print("\nRequired EAPOL messages to capture:")
-        print("  1. M1+M2 only  (fast; enough for hashcat -m 22000)")
-        print("  2. M1+M2+M3+M4 (full four-way exchange)")
-        messages = (1, 2) if choose("Message set [1/2], or q: ", 2) == 0 else (1, 2, 3, 4)
-
     available = adapters()
     if not available:
         raise RuntimeError("No wireless interfaces found.")
@@ -2031,7 +2926,6 @@ Client usage (Linux laptop):
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
-    saved = None
     try:
         with tempfile.TemporaryDirectory(prefix="wifi-handshake-") as tmp:
             directory = Path(tmp)
@@ -2061,7 +2955,7 @@ Client usage (Linux laptop):
                     print("This network does not advertise WPA/RSN. It has no WPA four-way handshake to capture.")
                     continue
                 break
-            result = capture(adapter, network, directory, args.timeout, args.max_mb, messages)
+            result = capture(adapter, network, directory, args.timeout, args.max_mb)
             if result is None:
                 return 1
             raw, frames = result
@@ -2074,34 +2968,58 @@ Client usage (Linux laptop):
             except BaseException:
                 output.unlink(missing_ok=True)
                 raise
-            names = "+".join(f"M{i}" for i in messages)
-            print(f"\nCaptured matching exchange ({names}) for client {frames[0]['client']}.")
+            print(f"\nComplete four-message exchange captured for client {frames[0]['client']}.")
             print(f"Saved: {output}")
-            print("Contains the exchange and target AP beacons. No password/MIC verification here.")
-            saved = output
+            print("Contains the exchange and target AP beacons. No password/MIC verification or cracking.")
+            return 0
     finally:
-        # A second Ctrl+C should not interrupt adapter restoration.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         adapter.restore()
-    if saved is not None and args.tower:
-        args.send = saved
-        return send_capture(args)
-    return 0
+
+
+def run_headless(args):
+    if args.watch:
+        if not args.tower:
+            raise RuntimeError("--watch requires --tower URL")
+        client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
+        return watch_job(client, args.watch, args.tower)
+    if args.send:
+        if not args.tower:
+            raise RuntimeError("--send requires --tower URL")
+        client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
+        health = client.health()
+        print(f"Tower: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
+        attack = choose_attack(client, args.attack)
+        print("Attack: " + json.dumps(attack))
+        job_id = client.create_job(prepare_capture(args.send), attack)["job_id"]
+        print(f"Job queued: {job_id}")
+        return watch_job(client, job_id, args.tower)
+    return None
+
+
+def main(argv=None):
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.self_test:
+            self_test()
+            return 0
+        if args.install_tools:
+            return install_tools(args.tools_dir)
+        headless = run_headless(args)
+        if headless is not None:
+            return headless
+        if args.run_capture:
+            result = run_capture_cli(args)
+            return 0 if result is None else result
+        return run_tui(args)
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return 130
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    # The interactive front-end lives in tui.py. This script is the engine and
-    # library; running it directly opens the TUI so there is a single entry point.
-    try:
-        import tui
-        sys.exit(tui.main())
-    except ImportError:
-        try:
-            sys.exit(main())
-        except (KeyboardInterrupt, EOFError):
-            print("\nCancelled. No incomplete capture saved.")
-            sys.exit(130)
-        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
+    sys.exit(main())
