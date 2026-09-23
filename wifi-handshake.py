@@ -58,6 +58,7 @@ import urllib.request
 import uuid
 
 MAC = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
+DEFAULT_PORT = 8443
 FIELDS = ["frame.number", "frame.time_epoch", "wlan.bssid", "wlan.sa", "wlan.da",
           "wlan_rsna_eapol.keydes.msgnr", "eapol.keydes.replay_counter",
           "wlan_rsna_eapol.keydes.nonce", "wlan_rsna_eapol.keydes.key_info.key_type",
@@ -185,6 +186,244 @@ def ensure_sudo(attempts=3):
             return SudoSession().start()
         warn(f"Wrong password ({attempt}/{attempts}).")
     raise RuntimeError("sudo authentication failed.")
+
+
+# ---------------------------------------------------------------------------
+# Tailscale integration
+#
+# The laptop and the tower are expected to live in the same tailnet. These
+# helpers wrap the `tailscale` CLI so the tool can show the tailnet, discover
+# the tower by its MagicDNS name and print the address the tower is reachable
+# at. Everything degrades gracefully: when Tailscale is missing or not logged
+# in, the rest of the tool keeps working with an explicit --tower URL.
+# ---------------------------------------------------------------------------
+
+TAILSCALE_STATES = {
+    "NoState": "not running",
+    "NeedsLogin": "logged out",
+    "NeedsMachineAuth": "awaiting approval",
+    "Stopped": "stopped",
+    "Starting": "starting",
+    "Running": "running",
+}
+
+
+# Optional socket override for tailscaled. The default install uses
+# /var/run/tailscale/tailscaled.sock; a userspace daemon
+# (`tailscaled --tun=userspace-networking --socket ...`) listens elsewhere.
+# Set WIFI_HANDSHAKE_TAILSCALE_SOCKET to talk to such a daemon.
+TAILSCALE_SOCKET_ENV = "WIFI_HANDSHAKE_TAILSCALE_SOCKET"
+
+
+def tailscale_binary():
+    return shutil.which("tailscale")
+
+
+def tailscale_available():
+    return tailscale_binary() is not None
+
+
+def tailscale_socket():
+    return os.environ.get(TAILSCALE_SOCKET_ENV)
+
+
+def tailscale_command(*args):
+    """Build a `tailscale` command, honouring the socket override."""
+    binary = tailscale_binary()
+    if not binary:
+        return None
+    command = [binary]
+    socket_path = tailscale_socket()
+    if socket_path:
+        command += ["--socket", socket_path]
+    command += list(args)
+    return command
+
+
+def _tailscale(*args, timeout=10):
+    command = tailscale_command(*args)
+    if command is None:
+        return None
+    try:
+        return subprocess.run(command, text=True, timeout=timeout,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def tailscale_status(timeout=10):
+    """Parse `tailscale status --json` into a small summary, or ``None``.
+
+    ``None`` means Tailscale is not installed, the daemon is not running or the
+    output could not be parsed. The returned dict always carries ``state`` and a
+    list of peers sorted with online peers first.
+    """
+    result = _tailscale("status", "--json", timeout=timeout)
+    if result is None or result.returncode:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    self_node = data.get("Self") or {}
+    peers = []
+    for node in (data.get("Peer") or {}).values():
+        addresses = node.get("TailscaleIPs") or []
+        peers.append({
+            "hostname": node.get("HostName") or "",
+            "dns_name": (node.get("DNSName") or "").rstrip("."),
+            "ip": addresses[0] if addresses else "",
+            "os": node.get("OS") or "",
+            "online": bool(node.get("Online")),
+            "active": bool(node.get("Active")),
+        })
+    peers.sort(key=lambda peer: (not peer["online"], peer["hostname"].lower()))
+    self_addresses = self_node.get("TailscaleIPs") or []
+    state = data.get("BackendState") or "NoState"
+    return {
+        "state": state,
+        "state_label": TAILSCALE_STATES.get(state, state),
+        "self_hostname": self_node.get("HostName") or "",
+        "self_dns_name": (self_node.get("DNSName") or "").rstrip("."),
+        "self_ip": self_addresses[0] if self_addresses else "",
+        "peers": peers,
+    }
+
+
+def tailscale_ready(status=None):
+    status = status or tailscale_status()
+    return bool(status and status["state"] == "Running")
+
+
+def tailscale_peer(name, status=None):
+    """Find a tailnet peer by hostname or MagicDNS name (case-insensitive)."""
+    status = status or tailscale_status()
+    if not status:
+        return None
+    wanted = name.rstrip(".").lower()
+    for peer in status["peers"]:
+        candidates = {peer["hostname"].lower(), peer["dns_name"].lower(),
+                      peer["dns_name"].split(".")[0].lower()}
+        if wanted in candidates:
+            return peer
+    return None
+
+
+def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
+    """Build a tower URL from a tailnet peer's MagicDNS name or IP, or None."""
+    status = tailscale_status()
+    if not tailscale_ready(status):
+        return None
+    peer = tailscale_peer(name, status)
+    if not peer:
+        return None
+    host = peer["dns_name"] or peer["ip"]
+    if not host:
+        return None
+    return f"{scheme}://{host}:{port}"
+
+
+def print_tailscale_status(status=None):
+    """Print a human-readable tailnet summary and return the status dict."""
+    if not tailscale_available():
+        warn("Tailscale is not installed. Install it to reach the tower over the tailnet.")
+        return None
+    status = status or tailscale_status()
+    if not status:
+        warn("Tailscale is not running. Start it with `sudo tailscale up`.")
+        return None
+    summary = f"Tailscale: {status['state_label']}"
+    if status["self_hostname"]:
+        summary += f" as {status['self_hostname']}"
+    if status["self_ip"]:
+        summary += f" ({status['self_ip']})"
+    if status["state"] == "Running":
+        ok(summary)
+    else:
+        warn(summary)
+        info("Run `sudo tailscale up` (or menu item 7) to join the tailnet.")
+        return status
+    if not status["peers"]:
+        info("No peers in the tailnet yet.")
+        return status
+    print(style(f"  {'#':>3}  {'Online':<7} {'Host':<24} {'OS':<9} Address", "bold"))
+    for index, peer in enumerate(status["peers"], 1):
+        mark = "yes" if peer["online"] else "no"
+        print(f"  {index:>3}  {mark:<7} {peer['hostname'][:23]:<24} {peer['os'][:8]:<9} "
+              f"{peer['dns_name'] or peer['ip']}")
+    return status
+
+
+def tailscale_login():
+    """Bring this device into the tailnet (runs `tailscale up`)."""
+    binary = tailscale_binary()
+    if not binary:
+        warn("Tailscale is not installed. See https://tailscale.com/download")
+        return 1
+    status = tailscale_status()
+    if tailscale_ready(status):
+        ok("Already connected to the tailnet as " + (status["self_hostname"] or "this device") + ".")
+        print_tailscale_status(status)
+        return 0
+    command = tailscale_command("up", "--accept-routes")
+    if command is None:
+        warn("Tailscale is not installed. See https://tailscale.com/download")
+        return 1
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+        command = ["sudo", *command]
+    print("Starting: " + " ".join(command))
+    try:
+        subprocess.run(command, check=False)
+    except OSError as exc:
+        warn(f"Could not start Tailscale: {exc}")
+        return 1
+    return 0 if tailscale_ready() else 1
+
+
+def choose_tailscale_tower(args):
+    """Offer tailnet peers as the tower and remember the chosen URL."""
+    status = print_tailscale_status()
+    if not status or status["state"] != "Running" or not status["peers"]:
+        return None
+    answer = input("Use a peer as tower (number), or Enter to skip: ").strip()
+    if not answer.isdecimal() or not 1 <= int(answer) <= len(status["peers"]):
+        return None
+    peer = status["peers"][int(answer) - 1]
+    host = peer["dns_name"] or peer["ip"]
+    if not host:
+        return None
+    args.tower = f"https://{host}:{getattr(args, 'port', DEFAULT_PORT)}"
+    ok("Tower URL set to " + args.tower)
+    return args.tower
+
+
+def resolve_tower(args, name=None):
+    """Fill in ``args.tower`` from the tailnet when it was not set explicitly.
+
+    Discovery is only attempted when a tower name is known: either the
+    ``--tower-name`` value or the default ``tower``. Returns the URL or None.
+    """
+    if getattr(args, "tower", None):
+        return args.tower
+    if not tailscale_available():
+        return None
+    wanted = name or getattr(args, "tower_name", None) or "tower"
+    url = tailscale_tower_url(wanted, getattr(args, "port", DEFAULT_PORT))
+    if url:
+        ok(f"Found tailnet peer '{wanted}': {url}")
+        args.tower = url
+        return url
+    return None
+
+
+def prompt_tower(args):
+    """Return a tower URL, trying tailnet discovery before manual input."""
+    if getattr(args, "tower", None):
+        return args.tower
+    if resolve_tower(args):
+        return args.tower
+    args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
+    return args.tower
 
 
 def choose(prompt, size):
@@ -1092,7 +1331,6 @@ def download_example_captures(directory, repo=EXAMPLE_CAPTURES_REPO):
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION = 1
-DEFAULT_PORT = 8443
 HASHCAT_MODE = "22000"
 HASHCAT_VERSION = "7.1.2"
 HASHCAT_URL = ("https://github.com/hashcat/hashcat/releases/download/"
@@ -2030,6 +2268,10 @@ def serve(args):
     scheme = "https" if context else "http"
     print(f"Tower listening on {scheme}://{config.host}:{config.port}")
     print(f"Jobs: {config.jobs_dir}  Wordlists: {[str(d) for d in config.wordlist_dirs]}")
+    tailnet = tailscale_status()
+    if tailnet and tailnet["state"] == "Running" and tailnet["self_dns_name"]:
+        print(f"Reachable in the tailnet as {tailnet['self_dns_name']} "
+              f"(use: --tower https://{tailnet['self_dns_name']}:{config.port})")
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()
@@ -2679,15 +2921,15 @@ def run_interactive(args):
               + style("(offline: find/verify a handshake in a file)", "dim"))
         print("  " + style("6", "bold") + ". Example captures   "
               + style("(download public test data)", "dim"))
+        print("  " + style("7", "bold") + ". Tailscale          "
+              + style("(status, log in, pick the tower in your tailnet)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
             code, captured = menu_capture(args)
             if code == 0 and captured:
                 if input("Send this capture to a tower now? [y/N] ").strip().lower() == "y":
-                    if not args.tower:
-                        args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
-                    if args.tower:
+                    if prompt_tower(args):
                         args.send = Path(captured)
                         run_headless(args)
                     else:
@@ -2697,9 +2939,7 @@ def run_interactive(args):
             serve(args)
             continue
         if choice == "3":
-            if not args.tower:
-                args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
-            if not args.tower:
+            if not prompt_tower(args):
                 warn("No tower URL set. Aborting.")
                 continue
             if not args.send:
@@ -2729,6 +2969,14 @@ def run_interactive(args):
             target = input("Target directory [test-captures]: ").strip() or "test-captures"
             download_example_captures(Path(target), args.captures_repo)
             continue
+        if choice == "7":
+            print_tailscale_status()
+            answer = input("Action: [Enter] back, l to log in, t to pick a tower: ").strip().lower()
+            if answer == "l":
+                tailscale_login()
+            elif answer == "t":
+                choose_tailscale_tower(args)
+            continue
         if choice in ("q", ""):
             return 0
         warn("Invalid choice.")
@@ -2754,6 +3002,8 @@ def build_parser():
   python wifi-handshake.py --inspect cap.pcapng  # find a handshake offline
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW  # verify MIC
   python wifi-handshake.py --download-captures   # fetch example captures
+  python wifi-handshake.py --tailscale-status    # show the tailnet and peers
+  python wifi-handshake.py --send cap.pcapng --tower-name tower  # find tower via Tailscale
 
 Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the tower
 and client roles work on every platform. Capture dependencies on Arch:
@@ -2812,6 +3062,14 @@ Only test networks you own or have permission to test.
     headless.add_argument("--watch", help="reattach to an existing job id")
     headless.add_argument("--attack", type=Path, help="JSON file with attack parameters")
     headless.add_argument("--fingerprint", help="pinned tower certificate sha256 fingerprint")
+
+    tailscale = parser.add_argument_group("tailscale (tower discovery over the tailnet)")
+    tailscale.add_argument("--tower-name", help="tailnet hostname of the tower "
+                                                "(default when discovering: tower)")
+    tailscale.add_argument("--tailscale-status", action="store_true",
+                           help="print tailnet status and peers, then exit")
+    tailscale.add_argument("--tailscale-login", action="store_true",
+                           help="join the tailnet (`tailscale up`), then exit")
     return parser
 
 
@@ -2973,13 +3231,15 @@ def run_capture_cli(args):
 
 def run_headless(args):
     if args.watch:
+        resolve_tower(args)
         if not args.tower:
-            raise RuntimeError("--watch requires --tower URL")
+            raise RuntimeError("--watch requires --tower URL or --tower-name")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         return watch_job(client, args.watch, args.tower)
     if args.send:
+        resolve_tower(args)
         if not args.tower:
-            raise RuntimeError("--send requires --tower URL")
+            raise RuntimeError("--send requires --tower URL or --tower-name")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         health = client.health()
         print(f"Tower: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
@@ -3005,6 +3265,11 @@ def main(argv=None):
         if args.inspect:
             summary = inspect_capture(args.inspect, args.essid, args.password)
             return 1 if summary["mismatched"] else 0
+        if args.tailscale_login:
+            return tailscale_login()
+        if args.tailscale_status:
+            print_tailscale_status()
+            return 0
         headless = run_headless(args)
         if headless is not None:
             return headless

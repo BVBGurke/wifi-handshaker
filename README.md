@@ -67,6 +67,9 @@ from a shell (`--run-capture`).
 ### Network
 * Both devices in the same tailnet (e.g. `tower` reachable via MagicDNS).
 * The tower does not need to be publicly reachable — Tailscale handles NAT traversal.
+* Join the tailnet on each device with `sudo tailscale up`, or from the tool with
+  `python wifi-handshake.py --tailscale-login` (menu item **7 – Tailscale**).
+  `--tailscale-status` shows the peers and the MagicDNS names used for discovery.
 
 ---
 
@@ -110,6 +113,7 @@ wifi-handshake - Terminal Menu
   4. Help / Install     (--help, download hashcat)
   5. Inspect capture    (offline: find/verify a handshake in a file)
   6. Example captures   (download public test data)
+  7. Tailscale          (status, log in, pick the tower in your tailnet)
   q  Quit
 ```
 
@@ -139,7 +143,40 @@ python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 ```
 Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
-`--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`.
+`--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
+`--tower-name NAME`, `--tailscale-status`, `--tailscale-login`.
+
+### Tailscale (tower discovery)
+
+The tower does not need a public address: put both machines in the same
+**tailnet** and let Tailscale handle NAT traversal. The tool wraps the
+`tailscale` CLI so you rarely have to type a URL:
+
+```
+python wifi-handshake.py --tailscale-status   # show this node and all peers
+python wifi-handshake.py --tailscale-login    # join the tailnet (`tailscale up`)
+python wifi-handshake.py --send capture.pcapng --tower-name tower
+```
+
+`--tailscale-status` prints the login state, this device's tailnet name/IP and a
+numbered list of peers. `--tower-name NAME` looks that peer up by its **MagicDNS
+hostname** and builds `https://NAME.<tailnet>.ts.net:<port>` (the default name
+when discovering is `tower`). Without `--tower`, an upload (`--send`/`--watch`)
+also falls back to discovering a peer named `tower`. Menu item **7 – Tailscale**
+does all of this interactively and lets you store a peer as the tower for later
+sends.
+
+`--serve` prints the MagicDNS name the tower is reachable at, e.g.
+`use: --tower https://tower.tailnet.ts.net:8443`.
+
+If Tailscale is not installed or the daemon is not running the helpers only warn
+and the tool keeps working with an explicit `--tower URL`. A userspace daemon
+(no root) is supported by pointing at its socket:
+
+```
+WIFI_HANDSHAKE_TAILSCALE_SOCKET=/run/user/1000/tailscaled.sock \
+  python wifi-handshake.py --tailscale-status
+```
 
 ### Offline inspection and example captures
 
