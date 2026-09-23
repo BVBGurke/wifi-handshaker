@@ -1792,7 +1792,12 @@ def inspect_capture(path, ssid=None, password=None):
                 summary["mismatched"] += 1
                 fail(f"  MIC MISMATCH for AP {ap.hex()}, client {sta.hex()}.")
         return summary
-    text = run("tshark", "-n", "-r", str(path), *field_options()).stdout
+    try:
+        text = run("tshark", "-n", "-r", str(path), *field_options()).stdout
+    except RuntimeError:
+        warn("This file is not a readable capture (tshark rejected it). "
+             "Is the file complete and a .pcap/.pcapng/.cap file?")
+        return {"handshakes": 0, "verified": 0, "mismatched": 0}
     trackers, found = {}, []
     for line in text.splitlines():
         fields = line.split("\t")

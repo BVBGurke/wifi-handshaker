@@ -1,5 +1,16 @@
 # wifi-handshake
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-3776AB" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
+  <img src="https://img.shields.io/badge/Capture-passive%20only-blueviolet" alt="Passive capture only">
+  <img src="https://img.shields.io/badge/Transport-TLS%20%2B%20Tailscale-success" alt="TLS + Tailscale">
+  <img src="https://github.com/BVBGurke/wifi-handshaker/actions/workflows/ci.yml/badge.svg" alt="CI">
+</p>
+
+> **Passive WPA/WPA2 handshake capture on Linux + GPU cracking with hashcat on
+> a Windows host over Tailscale — one Python file, no hcxtools/tshark required.**
+
 Passive WPA handshake capture on a Linux laptop and GPU cracking on a
 Windows host. The laptop grabs the handshake and sends it over Tailscale to
 the host; the host cracks it with `hashcat` on the GPU and sends the result
