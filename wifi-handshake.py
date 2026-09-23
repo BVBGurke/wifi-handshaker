@@ -27,6 +27,7 @@ PROJECT RULE: all user-facing text is ENGLISH. Do not localize the interface
 import argparse
 import base64
 import collections
+import concurrent.futures
 import contextlib
 import csv
 import getpass
@@ -397,7 +398,28 @@ def choose_tailscale_tower(args):
     return args.tower
 
 
-TOWER_PROBE_TIMEOUT = 1.5
+TOWER_PROBE_TIMEOUT = 2.0
+
+
+def ping_latency(host, timeout=TOWER_PROBE_TIMEOUT):
+    """Round-trip time to host in milliseconds via one ICMP ping, or None."""
+    binary = shutil.which("ping")
+    if not binary or not host:
+        return None
+    seconds = max(1, int(timeout))
+    if os.name == "nt":
+        args = [binary, "-n", "1", "-w", str(seconds * 1000), host]
+    else:
+        args = [binary, "-c", "1", "-W", str(seconds), host]
+    try:
+        result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=seconds + 2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    match = re.search(r"time[=<]\s*([\d.]+)\s*ms", result.stdout)
+    return float(match.group(1)) if match else None
 
 
 def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
@@ -435,29 +457,71 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
     return None
 
 
-def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
-    """Probe every online tailnet peer for a running tower.
+def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
+    """List every online tailnet device with latency and tower status.
 
-    Returns a list of peer dicts extended with ``scheme``, ``url`` and the
-    ``health`` payload of each responding tower.
+    This device is included and marked with ``self=True``. Each peer is probed
+    in parallel: one ICMP ping for the latency and the tower health handshake
+    (HTTPS first, then HTTP) to see whether it runs a tower. The result is
+    sorted online-first and then by hostname.
     """
     status = status or tailscale_status()
     if not tailscale_ready(status):
         return []
-    found = []
+    entries = []
+    if status["self_ip"]:
+        entries.append({
+            "hostname": status["self_hostname"] or "this-device",
+            "dns_name": status["self_dns_name"], "ip": status["self_ip"],
+            "os": platform_name(), "online": True, "active": True, "self": True,
+        })
     for peer in status["peers"]:
-        if not peer["online"]:
-            continue
-        host = peer["ip"] or peer["dns_name"]
-        if not host:
-            continue
-        probe = probe_tower(host, port, timeout)
-        if probe is None:
-            continue
-        scheme, health = probe
-        found.append({**peer, "scheme": scheme, "health": health,
-                      "url": f"{scheme}://{host}:{port}"})
-    return found
+        if peer["online"]:
+            entries.append({**peer, "self": False})
+
+    def probe(entry):
+        host = entry["ip"] or entry["dns_name"]
+        entry["latency"] = ping_latency(host, timeout) if host else None
+        found = probe_tower(host, port, timeout) if host else None
+        entry["tower"] = found is not None
+        if found:
+            entry["scheme"], entry["health"] = found
+            entry["url"] = f"{found[0]}://{host}:{port}"
+        return entry
+
+    if entries:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(entries))) as pool:
+            entries = list(pool.map(probe, entries))
+    entries.sort(key=lambda entry: (not entry["online"], entry["hostname"].lower()))
+    return entries
+
+
+def print_tailnet_devices(devices):
+    if not devices:
+        info("No reachable devices in the tailnet.")
+        return
+    print(style(f"  {'#':>3}  {'Host':<24} {'IP':<16} {'Ping':>7}  "
+                f"{'Backend':<9} Hashcat", "bold"))
+    for index, device in enumerate(devices, 1):
+        name = device["hostname"][:23]
+        if device.get("self"):
+            name += " *"
+        ping = f"{device['latency']:.0f} ms" if device.get("latency") is not None else "-"
+        if device.get("tower"):
+            health = device.get("health") or {}
+            backend = str(health.get("backend") or "auto")[:8]
+            hashcat = str(health.get("hashcat_version") or "-")[:12]
+        else:
+            backend, hashcat = "(no tower)", "-"
+        print(f"  {index:>3}  {name:<24} {device['ip']:<16} {ping:>7}  "
+              f"{backend:<9} {hashcat}")
+    info("* marks this device.")
+
+
+def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
+    """Return only the tailnet devices that run a tower."""
+    return [device for device in scan_tailnet_devices(port, status, timeout)
+            if device.get("tower")]
 
 
 def print_tailnet_towers(towers):
@@ -470,39 +534,75 @@ def print_tailnet_towers(towers):
         print(f"  {index:>3}  {tower['hostname'][:23]:<24} {str(backend)[:11]:<12} {tower['url']}")
 
 
-def connect_tailnet_tower(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
-    """Scan the tailnet for a running tower and set ``args.tower`` to it.
+def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
+    """Interactive device picker: scan the tailnet, list devices, connect.
 
-    A peer matching ``--tower-name`` is preferred; otherwise the first
-    reachable tower is used. Returns the URL or None.
+    Lists every reachable device (towers marked), supports a name/IP filter,
+    ``r`` to rescan and ``q`` to cancel, and only offers a manual URL when no
+    tower was found. The chosen tower is kept for this session only.
     """
+    port = port or getattr(args, "port", DEFAULT_PORT)
     status = tailscale_status()
     if not tailscale_ready(status):
+        warn("Tailscale is not running.")
+        if input("Log in to Tailscale now? [y/N] ").strip().lower() == "y":
+            tailscale_login()
         return None
-    port = port or getattr(args, "port", DEFAULT_PORT)
-    heading("Scanning the tailnet for running towers")
-    towers = discover_tailnet_towers(port, status, timeout)
-    print_tailnet_towers(towers)
-    if not towers:
-        return None
-    wanted = getattr(args, "tower_name", None)
-    chosen = None
-    if wanted:
-        chosen = next((tower for tower in towers if wanted.lower() in
-                       (tower["hostname"].lower(), tower["dns_name"].lower())), None)
-    if chosen is None:
-        chosen = towers[0]
-    args.tower = chosen["url"]
-    ok(f"Connected to tower {chosen['hostname']} at {chosen['url']}")
-    return args.tower
+    devices = scan_tailnet_devices(port, status, timeout)
+    query = None
+    while True:
+        heading("Devices in the tailnet")
+        shown = [device for device in devices
+                 if not query or query in device["hostname"].lower()
+                 or query in (device["ip"] or "")]
+        print_tailnet_devices(shown)
+        if not devices:
+            answer = input("[r]escan, [m]anual URL, [q]uit: ").strip().lower()
+            if answer == "r":
+                devices = scan_tailnet_devices(port, status, timeout)
+                continue
+            if answer == "m":
+                args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
+                return args.tower
+            return None
+        has_tower = any(device.get("tower") for device in shown)
+        if not has_tower:
+            info("None of these devices runs a tower.")
+        extra = "" if has_tower else ", m=manual URL"
+        info(f"Number to pick, text to filter, r=rescan{extra}, q=cancel.")
+        answer = input("Device: ").strip()
+        low = answer.lower()
+        if low in ("q", ""):
+            return None
+        if low == "r":
+            devices = scan_tailnet_devices(port, status, timeout)
+            query = None
+            continue
+        if low == "m" and not has_tower:
+            args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
+            return args.tower
+        if answer.isdecimal() and 1 <= int(answer) <= len(shown):
+            device = shown[int(answer) - 1]
+            if not device.get("tower"):
+                warn(f"{device['hostname']} does not run a tower.")
+                continue
+            if input(f"Connect to {device['hostname']} at {device['url']}? [Y/n] "
+                     ).strip().lower() in ("n", "no"):
+                continue
+            args.tower = device["url"]
+            ok("Tower set to " + args.tower)
+            return args.tower
+        query = low
+        if not shown:
+            warn(f"No device matches '{answer}'.")
+            query = None
 
 
 def resolve_tower(args, name=None):
-    """Fill in ``args.tower`` from the tailnet when it was not set explicitly.
+    """Resolve ``args.tower`` from a tailnet peer name (non-interactive).
 
-    First tries the named peer (``--tower-name`` or the default ``tower``).
-    When no such peer exists, the whole tailnet is scanned for a running tower
-    and the first reachable one is connected automatically. Returns the URL.
+    Only the named peer (``--tower-name`` or the default ``tower``) is looked
+    up; nothing is scanned and the user is never prompted. Returns the URL.
     """
     if getattr(args, "tower", None):
         return args.tower
@@ -513,17 +613,16 @@ def resolve_tower(args, name=None):
     if url:
         ok(f"Found tailnet peer '{wanted}': {url}")
         args.tower = url
-        return url
-    return connect_tailnet_tower(args)
+    return url
 
 
 def prompt_tower(args):
-    """Return a tower URL, trying tailnet discovery before manual input."""
+    """Pick a tower interactively: list tailnet devices, else ask for a URL."""
     if getattr(args, "tower", None):
         return args.tower
-    if resolve_tower(args):
+    if tailscale_available() and choose_tailnet_device(args):
         return args.tower
-    args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
+    args.tower = input("Tower URL (e.g. https://100.x.y.z:8443): ").strip() or None
     return args.tower
 
 
@@ -3015,7 +3114,7 @@ def run_interactive(args):
         print("  " + style("2", "bold") + ". Start tower        "
               + style("(server + hashcat, for the GPU box)", "dim"))
         print("  " + style("3", "bold") + ". Send capture       "
-              + style("(client, to --tower URL)", "dim"))
+              + style("(client: list tailnet devices, then upload)", "dim"))
         print("  " + style("4", "bold") + ". Help / Install     "
               + style("(--help, download hashcat)", "dim"))
         print("  " + style("5", "bold") + ". Inspect capture    "
@@ -3024,6 +3123,8 @@ def run_interactive(args):
               + style("(download public test data)", "dim"))
         print("  " + style("7", "bold") + ". Tailscale          "
               + style("(status, log in, pick the tower in your tailnet)", "dim"))
+        print("  " + style("8", "bold") + ". Devices            "
+              + style("(list reachable tailnet devices, pick the tower)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
@@ -3040,8 +3141,8 @@ def run_interactive(args):
             serve(args)
             continue
         if choice == "3":
-            if not prompt_tower(args):
-                warn("No tower URL set. Aborting.")
+            if not choose_tailnet_device(args):
+                warn("No tower selected. Aborting.")
                 continue
             if not args.send:
                 cap = input("Path to capture file (.pcapng/.hc22000): ").strip()
@@ -3073,13 +3174,16 @@ def run_interactive(args):
         if choice == "7":
             print_tailscale_status()
             answer = input("Action: [Enter] back, l to log in, t to pick a peer, "
-                           "d to scan + connect a tower: ").strip().lower()
+                           "d to list devices + connect: ").strip().lower()
             if answer == "l":
                 tailscale_login()
             elif answer == "t":
                 choose_tailscale_tower(args)
             elif answer == "d":
-                connect_tailnet_tower(args)
+                choose_tailnet_device(args)
+            continue
+        if choice == "8":
+            choose_tailnet_device(args)
             continue
         if choice in ("q", ""):
             return 0
@@ -3107,6 +3211,7 @@ def build_parser():
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW  # verify MIC
   python wifi-handshake.py --download-captures   # fetch example captures
   python wifi-handshake.py --tailscale-status    # show the tailnet and peers
+  python wifi-handshake.py --list-devices        # list reachable tailnet devices
   python wifi-handshake.py --discover-towers     # scan the tailnet for running towers
   python wifi-handshake.py --send cap.pcapng --tower-name tower  # find tower via Tailscale
 
@@ -3177,6 +3282,8 @@ Only test networks you own or have permission to test.
                            help="join the tailnet (`tailscale up`), then exit")
     tailscale.add_argument("--discover-towers", action="store_true",
                            help="scan tailnet peers for running towers, then exit")
+    tailscale.add_argument("--list-devices", action="store_true",
+                           help="list all reachable tailnet devices, then exit")
     return parser
 
 
@@ -3337,16 +3444,23 @@ def run_capture_cli(args):
 
 
 def run_headless(args):
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if args.watch:
         resolve_tower(args)
+        if not args.tower and interactive:
+            choose_tailnet_device(args)
         if not args.tower:
-            raise RuntimeError("--watch requires --tower URL or --tower-name")
+            raise RuntimeError("--watch needs a tower: pass --tower URL or --tower-name NAME, "
+                               "or list devices with --list-devices.")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         return watch_job(client, args.watch, args.tower)
     if args.send:
         resolve_tower(args)
+        if not args.tower and interactive:
+            choose_tailnet_device(args)
         if not args.tower:
-            raise RuntimeError("--send requires --tower URL or --tower-name")
+            raise RuntimeError("--send needs a tower: pass --tower URL or --tower-name NAME, "
+                               "or list devices with --list-devices.")
         client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
         health = client.health()
         print(f"Tower: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
@@ -3382,6 +3496,12 @@ def main(argv=None):
                 warn("Tailscale is not running. Start it with `sudo tailscale up`.")
                 return 1
             print_tailnet_towers(discover_tailnet_towers(args.port))
+            return 0
+        if args.list_devices:
+            if not tailscale_ready():
+                warn("Tailscale is not running. Start it with `sudo tailscale up`.")
+                return 1
+            print_tailnet_devices(scan_tailnet_devices(args.port, timeout=TOWER_PROBE_TIMEOUT))
             return 0
         headless = run_headless(args)
         if headless is not None:

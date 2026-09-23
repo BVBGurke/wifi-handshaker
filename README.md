@@ -111,11 +111,12 @@ Without arguments `wifi-handshake.py` starts an interactive terminal menu:
 wifi-handshake - Terminal Menu
   1. Capture handshake  (Linux, monitor mode, root)
   2. Start tower        (server + hashcat, for the GPU box)
-  3. Send capture       (client, to --tower URL)
+  3. Send capture       (client: list tailnet devices, then upload)
   4. Help / Install     (--help, download hashcat)
   5. Inspect capture    (offline: find/verify a handshake in a file)
   6. Example captures   (download public test data)
   7. Tailscale          (status, log in, pick the tower in your tailnet)
+  8. Devices            (list reachable tailnet devices, pick the tower)
   q  Quit
 ```
 
@@ -147,7 +148,7 @@ Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
 `--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
 `--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
-`--discover-towers`.
+`--discover-towers`, `--list-devices`.
 
 ### Tailscale (tower discovery)
 
@@ -158,7 +159,8 @@ The tower does not need a public address: put both machines in the same
 ```
 python wifi-handshake.py --tailscale-status   # show this node and all peers
 python wifi-handshake.py --tailscale-login    # join the tailnet (`tailscale up`)
-python wifi-handshake.py --discover-towers    # scan peers for a running tower
+python wifi-handshake.py --list-devices       # list reachable tailnet devices
+python wifi-handshake.py --discover-towers    # only peers that run a tower
 python wifi-handshake.py --send capture.pcapng --tower-name tower
 ```
 
@@ -167,13 +169,26 @@ numbered list of peers. `--tower-name NAME` looks that peer up by its hostname
 and builds the tower URL from its **tailnet IP**, e.g.
 `https://100.x.y.z:<port>` (the default name when discovering is `tower`).
 
-**Auto-discovery:** `--discover-towers` probes every online peer on the tower
-port and performs the tower **health handshake** (`/api/v1/health`), so only
-peers that really run the tower are listed. When no peer matches `--tower-name`,
-an upload (`--send`/`--watch`) falls back to scanning the tailnet and connecting
-to the first reachable tower automatically. Menu item **7 – Tailscale** offers
-this as action **d** (scan + connect) and lets you store a peer as the tower for
-later sends.
+**Device list:** `--list-devices` and menu item **8 – Devices** list **every
+reachable device** in the tailnet — hostname, IP, ping latency, and (for
+towers) GPU backend and hashcat version. This device is marked with `*`, real
+towers are detected via the **health handshake** (`/api/v1/health`, HTTPS first,
+then HTTP). The device picker supports filtering by typing a name/IP:
+
+```
+  #  Host                     IP              Ping  Backend   Hashcat
+  1  JannisTower              100.105.183.20  12 ms  CUDA      v7.1.2
+  2  moonlight-debian         100.108.170.86   5 ms  (no tower) -
+  3  laptop *                 100.122.97.87    -    (no tower) -
+```
+
+Menu item **3 – Send capture** always opens this list first: pick a device
+(number), confirm, and the capture is uploaded. `r` rescans, `q` cancels, and a
+manual URL is only offered when **no tower** was found. The chosen tower is kept
+for the current session only. When Tailscale is not running the tool offers to
+log in instead of failing. `--discover-towers` lists only the actual towers.
+Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
+`--tower-name` and never prompt.
 
 `--serve` prints the tailnet IP the tower is reachable at, e.g.
 `use: --tower https://100.x.y.z:8443`.
