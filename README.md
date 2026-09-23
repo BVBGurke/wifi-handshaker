@@ -3,8 +3,8 @@
 Passive WPA-Handshake-Aufnahme auf einem Linux-Laptop und GPU-Cracking auf einem
 Windows-Tower. Der Laptop greift den Handshake auf und schickt ihn über
 Tailscale an den Tower; der Tower knackt ihn mit `hashcat` auf der GPU und
-schickt das Ergebnis zurück. Bedient wird alles über ein schlankes
-Terminal-TUI (Textual) oder klassisch im Terminal (`--run-capture`).
+schickt das Ergebnis zurück. Bedient wird alles über ein interaktives
+Terminal-Menü oder klassisch im Terminal (`--run-capture`).
 
 > Nur für Netze, die dir gehören oder für die du eine ausdrückliche Erlaubnis
 > hast. Ziel dieses Setups ist, das eigene Netz abzusichern.
@@ -30,12 +30,13 @@ Terminal-TUI (Textual) oder klassisch im Terminal (`--run-capture`).
   Fingerprint-Pinning, zusätzlich durch Tailscale (WireGuard) verschlüsselt.
 * **Keine App-Authentifizierung**: das Tailnet ist die Vertrauensgrenze. Jedes
   Gerät im Tailnet darf Jobs starten. Mit Tailscale-ACLs einschränkbar.
-* **Alles in einer Datei**: `wifi-handshake.py` enthält Engine und TUI. Die
-  Rolle (`-c/--client` oder `-h/--host`) wird über die Argumente gewählt.
+* **Alles in einer Datei**: `wifi-handshake.py` enthält Engine und das
+  Terminal-Menü. Der Modus (Capture / Tower / Client) wird im Menü gewählt.
 
 
-Alles steckt in **einer Datei**: `wifi-handshake.py`. Die Rolle (Capture-Client
-oder Tower-Server) wird über die Argumente und das Betriebssystem gewählt.
+Alles steckt in **einer Datei**: `wifi-handshake.py`. Ohne Argumente startet
+ein interaktives Terminal-Menü; der Modus (Capture, Tower, Client) wird dort
+ausgewählt.
 
 ---
 
@@ -69,7 +70,7 @@ oder Tower-Server) wird über die Argumente und das Betriebssystem gewählt.
 python wifi-handshake.py --install-tools
 ```
 Lädt die gepinnte `hashcat`-Version von GitHub, prüft die SHA256-Summe und
-entpackt sie nach `tools\`. Alternativ im TUI über **Setup → Install hashcat**.
+entpackt sie nach `tools\`. Alternativ per Menüpunkt **Install hashcat**.
 
 > **Wichtig:** Für `hcxtools` gibt es **kein offizielles Windows-Binary**
 > (ZerBea veröffentlicht nur Quellcode). Deshalb konvertiert standardmäßig der
@@ -81,7 +82,6 @@ entpackt sie nach `tools\`. Alternativ im TUI über **Setup → Install hashcat*
 ### Laptop: Capture-Tools
 ```
 sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
-pip install --user textual
 ```
 Prüfen ohne Radio/Sudo:
 ```
@@ -92,43 +92,50 @@ python wifi-handshake.py --self-test
 
 ## 4. Rollen und Benutzung
 
-`wifi-handshake.py` startet standardmäßig die TUI; die Rolle wählst du mit
-`-c/--client` (Capture-Laptop) oder `-h/--host` (GPU-Tower). Ohne Rolle läuft
-die Datei auf jedem System als kombinierte TUI und zeigt nur die passenden
-Screens. Capture (`--run-capture`) funktioniert klassisch ohne TUI und nur
-unter Linux.
+Ohne Argumente startet `wifi-handshake.py` ein interaktives Terminal-Menü:
 
-### Starten (TUI)
+```
+wifi-handshake - Terminal-Menue
+  1. Handshake aufnehmen  (Capture, Linux, sudo)
+  2. Tower starten        (Server + hashcat, fuer die GPU-Box)
+  3. Capture senden       (Client, an --tower URL)
+  4. Hilfe / Install      (--help, hashcat herunterladen)
+  q  Beenden
+```
+
+Modi gezielt ohne Menü per Argument:
 
 **Tower (Windows/GPU):**
 ```
-python wifi-handshake.py -h --port 8443
+python wifi-handshake.py --serve --port 8443
 ```
 **Laptop (Linux):**
 ```
-python wifi-handshake.py -c --tower https://tower:8443
+python wifi-handshake.py --run-capture
+```
+**Client-Upload (plattformneutral):**
+```
+python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 ```
 Optionen:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
-`--serve` (öffnet den Server-Screen), `--self-test`.
+`--serve`, `--self-test`.
 
-Auf Linux startet sich die Capture-Logik per `sudo` neu (wie das TUI es früher
-tat).
-
-### Menü und Tasten
+### Menüpunkte
 
 ```
-[↑/↓] navigieren   [enter] wählen   [q] quit
-[c] Capture        capture a handshake and crack it on the tower
-[t] Tower          tower status and connection test
-[j] Jobs           queue, history, reattach
-[s] Setup          setup / diagnose this machine
+1  Handshake aufnehmen   Capture auf dem Laptop (Linux, sudo)
+2  Tower starten         Server + hashcat, fuer die GPU-Box
+3  Capture senden        Client-Upload an die --tower URL
+4  Hilfe / Install       --help + hashcat herunterladen
+q  Beenden
 ```
 
 ### Schritt 1 – Tower starten (Windows)
-Setup → **Install hashcat** falls noch nicht vorhanden, dann im Menü `[t]` den
-Status prüfen. Der Server-Screen (`--serve`) startet den Dienst im TUI und
-zeigt Backend und Geräte:
+Per Menüpunkt **2 – Tower starten** oder direkt:
+```
+python wifi-handshake.py --serve --port 8443
+```
 ```
 tower tools: hashcat=...\tools\hashcat-7.1.2\hashcat.exe
 GPU backend: cuda
@@ -139,39 +146,40 @@ Ein selbstsigniertes Zertifikat wird beim ersten Start automatisch erzeugt
 (`~/.wifi-handshake/tower-cert.pem` / `tower-key.pem`).
 
 ### Schritt 2 – Handshake aufnehmen (Laptop)
-Menü `[c]`:
-1. EAPOL-Set wählen: **M1+M2** (schnell, reicht für `hashcat -m 22000`) oder
-   **M1+M2+M3+M4** (voller Vierweg).
+Per Menüpunkt **1 – Handshake aufnehmen** (oder `--run-capture`):
+1. EAPOL-Set wählen: `--handshake m1m2` (schnell, reicht für `hashcat -m 22000`)
+   oder `--handshake m1m2m3m4` (voller Vierweg).
 2. Adapter wählen (Monitor-Mode, dediziertes Radio).
-3. `y` bestätigt und startet den Scan; Netz aus der Liste wählen.
+3. `YES` bestätigt und startet den Scan; Netz aus der Liste wählen.
 4. Warten, bis ein passender Exchange auftaucht (ein Gerät muss sich neu
    verbinden). Danach wird gespeichert als
    `handshake-<datum>-<BSSID>-.pcapng`.
-5. `t` schickt die Aufnahme direkt an den Tower.
+5. Per Menüpunkt **3 – Capture senden** an den Tower schicken.
 
 ### Schritt 3 – Cracken lassen
-Menü `[c]` → Capture → `t`, oder direkt den Attack-Screen. Der Tower listet
-seine Wortlisten/Regeln; Angriffsart wählen und **Submit**.
-Der Crack-Screen zeigt Live-Status per WebSocket (mit Polling-Fallback):
+Der Tower listet seine Wortlisten/Regeln in der API; Angriffe starten per
+`--attack`-JSON über den Client (siehe unten). Live-Status läuft per WebSocket
+(mit Polling-Fallback):
 ```
 running | 12.3% | 845.2 kH/s | 64C | util 98% | ETA ... | base: rockyou.txt | rules: best64.rule
 ```
 Am Ende steht `Password found: <pw>` oder `Password not found with this attack.`
 
 ### Schritt 4 – Später wieder anhängen
-Menü `[j]` → Job markieren → **Watch selected**. Der Job läuft auf dem Tower
-weiter, auch wenn die Tethering-Verbindung abreißt.
+Per `--watch <job-id>` an einen laufenden Job anhängen. Der Job läuft auf dem
+Tower weiter, auch wenn die Tethering-Verbindung abreißt.
 
 ### Zertifikat-Pinning
 Beim ersten Kontakt wird der SHA256-Fingerprint angezeigt und einmalig
-bestätigt (gespeichert in `~/.wifi-handshake/known_hosts.json`). Im TUI
-überspringt `--insecure` das Pinning (nur bei vollem Vertrauen ins Netz).
+bestätigt (gespeichert in `~/.wifi-handshake/known_hosts.json`).
+`--insecure` überspringt das Pinning (nur bei vollem Vertrauen ins Netz).
 
 ---
 
-## 5. Angriffsarten
+## 5. Angriffsart wählen (Skripte/Engine)
 
-Im Attack-Screen wählst du Wortliste und/oder Maske; die Engine baut daraus:
+Der Tower listet seine Wortlisten/Regeln in der API. Mit `--attack attack.json`
+auf der Kommandozeile wählst du Wortliste und/oder Maske; die Engine baut daraus:
 
 ```json
 { "type": "dictionary", "wordlist": "rockyou.txt", "rules": ["best64.rule"] }
@@ -269,10 +277,9 @@ Es wird **nichts automatisch gelöscht** (alles bleibt zur Nachvollziehbarkeit).
 | `hashcat exited with code ...` | `hashcat.log` im Job-Ordner prüfen (Treiber, `--force` nötig?). |
 | `Upload is a raw capture but hcxpcapngtool is not available` | Auf dem Tower fehlt `hcxtools` (kein Windows-Binary). Auf dem Laptop `pacman -S hcxtools` installieren – der Client konvertiert dann lokal. |
 | `Unknown or disallowed file: x.txt` | Wortliste liegt nicht in einem Wortlisten-Ordner des Towers. |
-| `Certificate fingerprint mismatch` | Zertifikat des Towers neu erzeugt. `known_hosts.json` anpassen oder TUI mit `--insecure` starten. |
+| `Certificate fingerprint mismatch` | Zertifikat des Towers neu erzeugt. `known_hosts.json` anpassen oder mit `--insecure` verbinden. |
 | hashcat startet nicht (`is not a valid Win32 application`) | Nur ein `.cmd`-Shim gefunden; die Projekt-Kopie unter `tools\` verwenden. |
-| TUI zeigt „No tower set" | Im Tower-Screen verbinden, dann Screen neu öffnen. |
-| `rich`/`textual` fehlt | `pip install --user textual`. |
+| „No tower set" | Tower-URL mit `--tower URL` setzen oder im Menüpunkt 3 eingeben. |
 
 ---
 
@@ -281,7 +288,7 @@ Es wird **nichts automatisch gelöscht** (alles bleibt zur Nachvollziehbarkeit).
 * **Kein hcxtools-Auto-Install unter Windows** möglich – Konvertierung passiert
   standardmäßig auf dem Linux-Laptop.
 * Der Capture-Teil ist **nur unter Linux** lauffähig (iw/airodump-ng/tshark).
-  Unter Windows zeigt das TUI deshalb Setup/Tower/Jobs/Attack.
+  Auf macOS/Windows stehen Tower und Client-Upload zur Verfügung.
 * Die M1+M2-Erkennung prüft **Paketstruktur, nicht die MIC** – ein „passender“
   Exchange kann trotzdem kein gültiger Handshake sein.
 * Brute-Force scheitert in der Praxis häufig; „nicht gefunden“ ist normal.
@@ -293,23 +300,20 @@ Es wird **nichts automatisch gelöscht** (alles bleibt zur Nachvollziehbarkeit).
 
 ---
 
-## 12. TUI-Kurzreferenz
+## 12. Kurzreferenz
 
 ```
-Starten:
-  python wifi-handshake.py -c                          # Laptop (client)
-  python wifi-handshake.py -h --tower https://tower    # GPU-Box (host)
-  python wifi-handshake.py -h --port 8443 --serve      # Server-Screen
-  python wifi-handshake.py --self-test                 # Engine-Tests, kein Radio
-  python wifi-handshake.py --run-capture               # klassisch, ohne TUI (Linux)
+Starten (Menü):
+  python wifi-handshake.py                  # interaktives Terminal-Menü
+  python wifi-handshake.py --run-capture     # Capture direkt (Linux)
+  python wifi-handshake.py --serve --port 8443   # Tower-Server
+  python wifi-handshake.py --tower URL --send cap.pcapng   # Client-Upload
+  python wifi-handshake.py --self-test       # Engine-Tests, kein Radio
 
-Tasten im Menü:
-  c capture    Capture-Screen (Linux)
-  t tower      Tower-Status / Verbindung
-  j jobs       Queue/Historie, reattach, cancel
-  s setup      Diagnose + hashcat installieren
-  q quit       Beenden
-  esc          zurück
+Ablauf Capture (Menüpunkt 1):
+  Adapter waehlen -> YES bestaetigen -> Scan -> Netz waehlen
+  -> Handshake abwarten -> speichern als handshake-<datum>-<BSSID>.pcapng
+  -> q quit / r rescannen
 
 Ausgabe der Engine-API (für Skripte):
   Engine-Funktionen in wifi-handshake.py bleiben importierbar
