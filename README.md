@@ -1,109 +1,105 @@
 # wifi-handshake
 
-Passive WPA-Handshake-Aufnahme auf einem Linux-Laptop und GPU-Cracking auf einem
-Windows-Tower. Der Laptop greift den Handshake auf und schickt ihn über
-Tailscale an den Tower; der Tower knackt ihn mit `hashcat` auf der GPU und
-schickt das Ergebnis zurück. Bedient wird alles über ein interaktives
-Terminal-Menü oder klassisch im Terminal (`--run-capture`).
+Passive WPA handshake capture on a Linux laptop and GPU cracking on a
+Windows tower. The laptop grabs the handshake and sends it over Tailscale to
+the tower; the tower cracks it with `hashcat` on the GPU and sends the result
+back. Everything is driven from an interactive terminal menu or classically
+from a shell (`--run-capture`).
 
-> Nur für Netze, die dir gehören oder für die du eine ausdrückliche Erlaubnis
-> hast. Ziel dieses Setups ist, das eigene Netz abzusichern.
+> Only for networks you own or have explicit permission to test. The purpose
+> of this setup is to secure your own network.
 
 ---
 
-## 1. Überblick
+## 1. Overview
 
 ```
    Laptop (Linux, Arch)                     Tower (Windows + GPU)
    ┌───────────────────────┐   Tailscale   ┌──────────────────────────┐
-   │ WLAN-Karte Monitor    │   + TLS/WS    │ HTTP/JSON + WebSocket    │
+   │ WLAN card monitor     │   + TLS/WS    │ HTTP/JSON + WebSocket    │
    │ → Handshake (.pcapng) │ ────────────► │ hcxpcapngtool → .hc22000 │
-   │ Internet per USB-     │               │ hashcat -m 22000 (GPU)   │
-   │ Tethering (Handy)     │ ◄──────────── │ Live-Status + Passwort   │
+   │ Internet via USB      │               │ hashcat -m 22000 (GPU)   │
+   │ tethering (phone)     │ ◄──────────── │ live status + password   │
    └───────────────────────┘               └──────────────────────────┘
 ```
 
-* **Capture** ist rein passiv: kein Deauth, keine Injection. Es gibt bewusst
-  keinen Deauthentication-Sender — aktive Funkeingriffe sind strafbar (§ 303b
-  StGB) und „Reichweite" lässt sich bei 802.11 nicht adressieren.
-* **Transport** ist HTTPS mit selbstsigniertem Zertifikat und
-  Fingerprint-Pinning, zusätzlich durch Tailscale (WireGuard) verschlüsselt.
-* **Keine App-Authentifizierung**: das Tailnet ist die Vertrauensgrenze. Jedes
-  Gerät im Tailnet darf Jobs starten. Mit Tailscale-ACLs einschränkbar.
-* **Alles in einer Datei**: `wifi-handshake.py` enthält Engine und das
-  Terminal-Menü. Der Modus (Capture / Tower / Client) wird im Menü gewählt.
-
-
-Alles steckt in **einer Datei**: `wifi-handshake.py`. Ohne Argumente startet
-ein interaktives Terminal-Menü; der Modus (Capture, Tower, Client) wird dort
-ausgewählt.
+* **Capture is purely passive**: no deauth, no injection. There is
+  deliberately no deauthentication sender — active radio interference is a
+  criminal offense (§ 303b StGB) and "range" cannot be addressed in 802.11.
+* **Transport** is HTTPS with a self-signed certificate and fingerprint
+  pinning, additionally encrypted by Tailscale (WireGuard).
+* **No app-level authentication**: the tailnet is the trust boundary. Anyone
+  in the tailnet may start jobs. Restrict it with Tailscale ACLs if needed.
+* **One file for everything**: `wifi-handshake.py` contains the engine and the
+  terminal menu. The mode (capture / tower / client) is chosen in the menu.
 
 ---
 
-## 2. Voraussetzungen
+## 2. Requirements
 
 ### Laptop (Linux)
-* WLAN-Karte mit **Monitor-Mode** (dediziertes Radio, kein geteiltes PHY).
-* Internet **parallel** zum Sniffen, z. B. per **USB-Tethering** vom Handy.
-* Pakete:
+* WLAN card with **monitor mode** (dedicated radio, no shared PHY).
+* Internet **in parallel** to sniffing, e.g. via **USB tethering** from a phone.
+* Packages:
   ```
   sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
   ```
-* Tailscale installiert und im selben Tailnet wie der Tower.
+* Tailscale installed and in the same tailnet as the tower.
 
 ### Tower (Windows)
-* GPU: NVIDIA (CUDA) oder AMD (OpenCL/HIP) – Backend wird automatisch gewählt.
-* `hashcat` liegt als Projekt-Kopie unter `tools\hashcat-7.1.2\`.
-* `hcxpcapngtool.exe` **optional** (siehe Hinweis unten).
-* Tailscale installiert und im selben Tailnet wie der Laptop.
+* GPU: NVIDIA (CUDA) or AMD (OpenCL/HIP) — backend is auto-selected.
+* `hashcat` as a project copy under `tools\hashcat-7.1.2\`.
+* `hcxpcapngtool.exe` **optional** (see note below).
+* Tailscale installed and in the same tailnet as the laptop.
 
-### Netzwerk
-* Beide Geräte im selben Tailnet (z. B. `tower` per MagicDNS erreichbar).
-* Tower muss nicht öffentlich erreichbar sein – Tailscale übernimmt NAT-Traversal.
+### Network
+* Both devices in the same tailnet (e.g. `tower` reachable via MagicDNS).
+* The tower does not need to be publicly reachable — Tailscale handles NAT traversal.
 
 ---
 
 ## 3. Installation
 
-### Tower: GPU-Toolchain
+### Tower: GPU toolchain
 ```
 python wifi-handshake.py --install-tools
 ```
-Lädt die gepinnte `hashcat`-Version von GitHub, prüft die SHA256-Summe und
-entpackt sie nach `tools\`. Alternativ per Menüpunkt **Install hashcat**.
+Downloads the pinned `hashcat` version from GitHub, verifies the SHA256
+checksum and unpacks it into `tools\`. Alternatively use menu item
+**Install hashcat**.
 
-> **Wichtig:** Für `hcxtools` gibt es **kein offizielles Windows-Binary**
-> (ZerBea veröffentlicht nur Quellcode). Deshalb konvertiert standardmäßig der
-> **Linux-Laptop** (dort ist `hcxtools` ein Paket). Der Tower konvertiert nur,
-> falls `hcxpcapngtool` doch vorhanden ist. Ohne das Tool kann der Tower keine
-> rohen `.pcapng` verarbeiten – schick ihm `.hc22000` (macht der Client
-> automatisch).
+> **Important:** There is **no official Windows binary** for `hcxtools`
+> (ZerBea only publishes source). That is why by default the **Linux laptop**
+> does the conversion (there `hcxtools` is a package). The tower only converts
+> if `hcxpcapngtool` is actually present. Without it the tower cannot process
+> raw `.pcapng` files — send it `.hc22000` instead (the client does this
+> automatically).
 
-### Laptop: Capture-Tools
+### Laptop: capture tools
 ```
 sudo pacman -S --needed iw aircrack-ng wireshark-cli hcxtools python iproute2 sudo
 ```
-Prüfen ohne Radio/Sudo:
+Verify without radio/sudo:
 ```
 python wifi-handshake.py --self-test
 ```
 
 ---
 
-## 4. Rollen und Benutzung
+## 4. Roles and usage
 
-Ohne Argumente startet `wifi-handshake.py` ein interaktives Terminal-Menü:
+Without arguments `wifi-handshake.py` starts an interactive terminal menu:
 
 ```
-wifi-handshake - Terminal-Menue
-  1. Handshake aufnehmen  (Capture, Linux, sudo)
-  2. Tower starten        (Server + hashcat, fuer die GPU-Box)
-  3. Capture senden       (Client, an --tower URL)
-  4. Hilfe / Install      (--help, hashcat herunterladen)
-  q  Beenden
+wifi-handshake - Terminal Menu
+  1. Capture handshake  (Capture, Linux, sudo)
+  2. Start tower        (Server + hashcat, for the GPU box)
+  3. Send capture       (Client, to --tower URL)
+  4. Help / Install     (--help, download hashcat)
+  q  Quit
 ```
 
-Modi gezielt ohne Menü per Argument:
+Run modes without the menu:
 
 **Tower (Windows/GPU):**
 ```
@@ -113,26 +109,16 @@ python wifi-handshake.py --serve --port 8443
 ```
 python wifi-handshake.py --run-capture
 ```
-**Client-Upload (plattformneutral):**
+**Client upload (platform-neutral):**
 ```
 python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 ```
-Optionen:
+Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
 `--serve`, `--self-test`.
 
-### Menüpunkte
-
-```
-1  Handshake aufnehmen   Capture auf dem Laptop (Linux, sudo)
-2  Tower starten         Server + hashcat, fuer die GPU-Box
-3  Capture senden        Client-Upload an die --tower URL
-4  Hilfe / Install       --help + hashcat herunterladen
-q  Beenden
-```
-
-### Schritt 1 – Tower starten (Windows)
-Per Menüpunkt **2 – Tower starten** oder direkt:
+### Step 1 – Start the tower (Windows)
+Via menu item **2 – Start tower** or directly:
 ```
 python wifi-handshake.py --serve --port 8443
 ```
@@ -142,44 +128,48 @@ GPU backend: cuda
   CUDA GPU: NVIDIA GeForce RTX 4070 SUPER
 https://0.0.0.0:8443 listening
 ```
-Ein selbstsigniertes Zertifikat wird beim ersten Start automatisch erzeugt
+A self-signed certificate is created automatically on first start
 (`~/.wifi-handshake/tower-cert.pem` / `tower-key.pem`).
 
-### Schritt 2 – Handshake aufnehmen (Laptop)
-Per Menüpunkt **1 – Handshake aufnehmen** (oder `--run-capture`):
-1. EAPOL-Set wählen: `--handshake m1m2` (schnell, reicht für `hashcat -m 22000`)
-   oder `--handshake m1m2m3m4` (voller Vierweg).
-2. Adapter wählen (Monitor-Mode, dediziertes Radio).
-3. `YES` bestätigt und startet den Scan; Netz aus der Liste wählen.
-4. Warten, bis ein passender Exchange auftaucht (ein Gerät muss sich neu
-   verbinden). Danach wird gespeichert als
-   `handshake-<datum>-<BSSID>-.pcapng`.
-5. Per Menüpunkt **3 – Capture senden** an den Tower schicken.
+### Step 2 – Capture a handshake (Laptop)
+Via menu item **1 – Capture handshake** (or `--run-capture`):
+1. Choose the EAPOL set: `--handshake m1m2` (fast, enough for `hashcat -m 22000`)
+   or `--handshake m1m2m3m4` (full four-way). **`m1m2` is the default** because
+   M3/M4 are frequently lost in practice and hashcat only needs M1+M2.
+2. Choose the adapter (monitor mode, dedicated radio).
+3. Confirm with `YES` to start the scan; pick a network from the list. If the
+   scanner lists several SSIDs of the same access point (same AP base MAC), a
+   note tells you so — connect the test device to exactly the SSID you pick.
+4. Wait for a matching exchange (a device must reconnect). The tool prints
+   actionable hints when nothing arrives (toggle Wi-Fi on the test device,
+   check SSID/band, move closer). The result is saved as
+   `handshake-<date>-<BSSID>-.pcapng`.
+5. Send the capture to the tower via menu item **3 – Send capture**.
 
-### Schritt 3 – Cracken lassen
-Der Tower listet seine Wortlisten/Regeln in der API; Angriffe starten per
-`--attack`-JSON über den Client (siehe unten). Live-Status läuft per WebSocket
-(mit Polling-Fallback):
+### Step 3 – Have it cracked
+The tower lists its wordlists/rules in the API; attacks start via `--attack`
+JSON through the client (see below). Live status runs over WebSocket (with
+polling fallback):
 ```
 running | 12.3% | 845.2 kH/s | 64C | util 98% | ETA ... | base: rockyou.txt | rules: best64.rule
 ```
-Am Ende steht `Password found: <pw>` oder `Password not found with this attack.`
+At the end it shows `Password found: <pw>` or `Password not found with this attack.`
 
-### Schritt 4 – Später wieder anhängen
-Per `--watch <job-id>` an einen laufenden Job anhängen. Der Job läuft auf dem
-Tower weiter, auch wenn die Tethering-Verbindung abreißt.
+### Step 4 – Reattach later
+Reattach to a running job via `--watch <job-id>`. The job keeps running on the
+tower even if the tethering connection drops.
 
-### Zertifikat-Pinning
-Beim ersten Kontakt wird der SHA256-Fingerprint angezeigt und einmalig
-bestätigt (gespeichert in `~/.wifi-handshake/known_hosts.json`).
-`--insecure` überspringt das Pinning (nur bei vollem Vertrauen ins Netz).
+### Certificate pinning
+On first contact the SHA256 fingerprint is shown and confirmed once (stored in
+`~/.wifi-handshake/known_hosts.json`). `--insecure` skips pinning (only if you
+fully trust the network).
 
 ---
 
-## 5. Angriffsart wählen (Skripte/Engine)
+## 5. Choosing the attack (scripts/engine)
 
-Der Tower listet seine Wortlisten/Regeln in der API. Mit `--attack attack.json`
-auf der Kommandozeile wählst du Wortliste und/oder Maske; die Engine baut daraus:
+The tower lists its wordlists/rules in the API. With `--attack attack.json` on
+the command line you choose a wordlist and/or mask; the engine builds:
 
 ```json
 { "type": "dictionary", "wordlist": "rockyou.txt", "rules": ["best64.rule"] }
@@ -188,135 +178,134 @@ auf der Kommandozeile wählst du Wortliste und/oder Maske; die Engine baut darau
 { "type": "combination", "wordlist": "a.txt", "wordlist2": "b.txt" }
 ```
 
-Für Skripte bleibt die Engine-API nutzbar; sie akzeptiert dieselben Felder,
-inklusive `extra_args` (Whitelist u. a. `-w`, `-O`, `--force`, `-d`,
-`--increment*`) und `backend` (`cuda`/`opencl`/`hip`).
-
-```
+For scripts the engine API stays usable; it accepts the same fields including
+`extra_args` (whitelist includes `-w`, `-O`, `--force`, `-d`, `--increment*`)
+and `backend` (`cuda`/`opencl`/`hip`).
 
 ---
 
-## 6. GPU-Backend
+## 6. GPU backend
 
-Der Tower erkennt die Backends automatisch über `hashcat -I`:
+The tower detects backends automatically via `hashcat -I`:
 
 | GPU | Backend |
 |---|---|
-| NVIDIA | **CUDA** (bevorzugt) |
-| AMD unter Windows | **OpenCL** |
-| AMD unter Linux | **HIP** |
+| NVIDIA | **CUDA** (preferred) |
+| AMD on Windows | **OpenCL** |
+| AMD on Linux | **HIP** |
 | Intel | OpenCL |
 
-Es werden nur Backends abgeschaltet, die `hashcat -I` tatsächlich gemeldet hat
-(vermeidet ungültige Flags wie `--backend-ignore-metal` unter Windows).
-CPU-Backends werden ignoriert, solange eine GPU vorhanden ist.
+Only backends actually reported by `hashcat -I` are disabled (avoids invalid
+flags such as `--backend-ignore-metal` on Windows). CPU backends are ignored as
+long as a GPU is present.
 
 ---
 
-## 7. HTTP-API (Tower)
+## 7. HTTP API (tower)
 
-| Methode | Pfad | Zweck |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/v1/health` | Status, hashcat-Version, Backend, Geräte, Queue |
-| GET | `/api/v1/wordlists` | verfügbare Wortlisten und Regeln |
-| GET | `/api/v1/jobs` | Job-Liste |
-| GET | `/api/v1/jobs/{id}` | Job-Status |
-| GET | `/api/v1/jobs/{id}/result` | Ergebnis |
-| GET | `/api/v1/jobs/{id}/events` | WebSocket-Livestream |
-| POST | `/api/v1/jobs` | Job anlegen (Body = Capture, Header `X-Attack`/`X-Filename`) |
-| DELETE | `/api/v1/jobs/{id}` | Job abbrechen |
+| GET | `/api/v1/health` | status, hashcat version, backend, devices, queue |
+| GET | `/api/v1/wordlists` | available wordlists and rules |
+| GET | `/api/v1/jobs` | job list |
+| GET | `/api/v1/jobs/{id}` | job status |
+| GET | `/api/v1/jobs/{id}/result` | result |
+| GET | `/api/v1/jobs/{id}/events` | WebSocket live stream |
+| POST | `/api/v1/jobs` | create job (body = capture, headers `X-Attack`/`X-Filename`) |
+| DELETE | `/api/v1/jobs/{id}` | cancel job |
 
-`X-Attack` ist Base64-kodiertes JSON der Angriffsparameter.
+`X-Attack` is Base64-encoded JSON of the attack parameters.
 
 ---
 
-## 8. Ablage & Dateien
+## 8. Storage & files
 
-Basisordner: `~/.wifi-handshake` (per Umgebungsvariable `WIFI_HANDSHAKE_DIR`
-änderbar).
+Base folder: `~/.wifi-handshake` (changeable via the `WIFI_HANDSHAKE_DIR`
+environment variable).
 
 ```
 ~/.wifi-handshake/
-├── tower-cert.pem / tower-key.pem   # TLS (automatisch erzeugt)
-├── known_hosts.json                 # gepinnte Fingerprints (Client)
-├── tower.potfile                    # hashcat-Potfile (spart Rechenzeit)
+├── tower-cert.pem / tower-key.pem   # TLS (auto-generated)
+├── known_hosts.json                 # pinned fingerprints (client)
+├── tower.potfile                    # hashcat potfile (saves compute time)
 └── jobs/<job-id>/
-    ├── status.json                  # Zustand + Live-Werte + Kommando
-    ├── <upload>                     # hochgeladene .pcapng/.hc22000
-    ├── capture.hc22000              # falls serverseitig konvertiert
-    ├── convert.log                  # Ausgabe von hcxpcapngtool
-    ├── hashcat.log                  # vollständiges hashcat-Status-Log
-    └── cracked.txt                  # Klartext, falls gefunden
+    ├── status.json                  # state + live values + command
+    ├── <upload>                     # uploaded .pcapng/.hc22000
+    ├── capture.hc22000              # if converted server-side
+    ├── convert.log                  # output of hcxpcapngtool
+    ├── hashcat.log                  # full hashcat status log
+    └── cracked.txt                  # plaintext, if found
 ```
-Zusätzlich liegt die hashcat-Programmkopie unter `<Projekt>\tools\`.
+Additionally the hashcat program copy lives under `<project>\tools\`.
 
-Es wird **nichts automatisch gelöscht** (alles bleibt zur Nachvollziehbarkeit).
-
----
-
-## 9. Sicherheit
-
-* TLS selbstsigniert + **Fingerprint-Pinning** (TOFU).
-* **Keine App-Auth** – die Vertrauensgrenze ist das Tailnet. Wer den Port
-  erreicht, kann Jobs starten und GPU-Zeit verbrauchen.
-* Härtung: Tailscale-ACLs so setzen, dass nur der Laptop den Port erreichen darf.
-* Uploads: Größenlimit, Magic-Byte-Prüfung (pcap/pcapng/hc22000), Original wird
-  nie ausgeführt, nur die feste Konvertierung.
-* hashcat-Argumente: nur Whitelist-Flags; Wortlisten/Regeln werden nur als Name
-  aufgelöst (kein Path-Traversal).
-* **Kein Deauth/Injection**: Das Tool sendet nichts. Es kann also auch nicht
-  versehentlich fremde Netze stören.
+**Nothing is deleted automatically** (everything stays for traceability).
 
 ---
 
-## 10. Fehlersuche
+## 9. Security
 
-| Problem | Ursache / Lösung |
+* TLS self-signed + **fingerprint pinning** (TOFU).
+* **No app auth** — the trust boundary is the tailnet. Whoever can reach the
+  port can start jobs and consume GPU time.
+* Hardening: set Tailscale ACLs so only the laptop can reach the port.
+* Uploads: size limit, magic-byte check (pcap/pcapng/hc22000), the original is
+  never executed, only the fixed conversion.
+* hashcat arguments: only whitelisted flags; wordlists/rules are resolved by
+  name only (no path traversal).
+* **No deauth/injection**: The tool sends nothing, so it cannot accidentally
+  disturb foreign networks.
+
+---
+
+## 10. Troubleshooting
+
+| Problem | Cause / fix |
 |---|---|
-| `./OpenCL/: No such file or directory` | hashcat läuft mit falschem Arbeitsverzeichnis. Die Engine setzt automatisch `cwd` auf den hashcat-Ordner. |
-| `hashcat exited with code ...` | `hashcat.log` im Job-Ordner prüfen (Treiber, `--force` nötig?). |
-| `Upload is a raw capture but hcxpcapngtool is not available` | Auf dem Tower fehlt `hcxtools` (kein Windows-Binary). Auf dem Laptop `pacman -S hcxtools` installieren – der Client konvertiert dann lokal. |
-| `Unknown or disallowed file: x.txt` | Wortliste liegt nicht in einem Wortlisten-Ordner des Towers. |
-| `Certificate fingerprint mismatch` | Zertifikat des Towers neu erzeugt. `known_hosts.json` anpassen oder mit `--insecure` verbinden. |
-| hashcat startet nicht (`is not a valid Win32 application`) | Nur ein `.cmd`-Shim gefunden; die Projekt-Kopie unter `tools\` verwenden. |
-| „No tower set" | Tower-URL mit `--tower URL` setzen oder im Menüpunkt 3 eingeben. |
+| `./OpenCL/: No such file or directory` | hashcat runs with the wrong working directory. The engine sets `cwd` to the hashcat folder automatically. |
+| `hashcat exited with code ...` | check `hashcat.log` in the job folder (driver, `--force` needed?). |
+| `Upload is a raw capture but hcxpcapngtool is not available` | `hcxtools` is missing on the tower (no Windows binary). Install `pacman -S hcxtools` on the laptop — the client then converts locally. |
+| `Unknown or disallowed file: x.txt` | wordlist is not in a tower wordlist folder. |
+| `Certificate fingerprint mismatch` | certificate of the tower was recreated. Adjust `known_hosts.json` or connect with `--insecure`. |
+| hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
+| "No tower set" | set the tower URL with `--tower URL` or enter it in menu item 3. |
+| Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
 
 ---
 
-## 11. Grenzen (ehrlich)
+## 11. Limits (honest)
 
-* **Kein hcxtools-Auto-Install unter Windows** möglich – Konvertierung passiert
-  standardmäßig auf dem Linux-Laptop.
-* Der Capture-Teil ist **nur unter Linux** lauffähig (iw/airodump-ng/tshark).
-  Auf macOS/Windows stehen Tower und Client-Upload zur Verfügung.
-* Die M1+M2-Erkennung prüft **Paketstruktur, nicht die MIC** – ein „passender“
-  Exchange kann trotzdem kein gültiger Handshake sein.
-* Brute-Force scheitert in der Praxis häufig; „nicht gefunden“ ist normal.
-* Ein Job gleichzeitig (GPU), der Rest wartet in der Queue.
-* **Kein Deauth/Disassoc-Sender und keine „Reichweiten"-Steuerung**: aktive
-  Funkeingriffe sind strafbar (§ 303b StGB), und 802.11 hat kein Range-Feld.
-  Als Schutzmaßnahme stattdessen **802.11w/PMF** im AP aktivieren und WPA3/SAE
-  prüfen – dann sind Management-Frames geschützt.
+* **No hcxtools auto-install on Windows** — conversion happens on the Linux
+  laptop by default.
+* The capture part only runs **on Linux** (iw/airodump-ng/tshark). On
+  macOS/Windows only the tower and client upload are available.
+* M1+M2 detection checks **packet structure, not the MIC** — a "matching"
+  exchange may still not be a valid handshake.
+* Brute force frequently fails in practice; "not found" is normal.
+* One job at a time (GPU); the rest wait in the queue.
+* **No deauth/disassoc sender and no "range" control**: active radio
+  interference is a criminal offense (§ 303b StGB), and 802.11 has no range
+  field. As protection instead enable **802.11w/PMF** on the AP and check
+  WPA3/SAE — then management frames are protected.
 
 ---
 
-## 12. Kurzreferenz
+## 12. Quick reference
 
 ```
-Starten (Menü):
-  python wifi-handshake.py                  # interaktives Terminal-Menü
-  python wifi-handshake.py --run-capture     # Capture direkt (Linux)
-  python wifi-handshake.py --serve --port 8443   # Tower-Server
-  python wifi-handshake.py --tower URL --send cap.pcapng   # Client-Upload
-  python wifi-handshake.py --self-test       # Engine-Tests, kein Radio
+Start (menu):
+  python wifi-handshake.py                  # interactive terminal menu
+  python wifi-handshake.py --run-capture     # capture directly (Linux)
+  python wifi-handshake.py --serve --port 8443   # tower server
+  python wifi-handshake.py --tower URL --send cap.pcapng   # client upload
+  python wifi-handshake.py --self-test       # engine tests, no radio
 
-Ablauf Capture (Menüpunkt 1):
-  Adapter waehlen -> YES bestaetigen -> Scan -> Netz waehlen
-  -> Handshake abwarten -> speichern als handshake-<datum>-<BSSID>.pcapng
-  -> q quit / r rescannen
+Capture flow (menu item 1):
+  choose adapter -> confirm YES -> scan -> pick a network
+  -> select EAPOL set (M1+M2 default) -> wait for a handshake
+  -> saved as handshake-<date>-<BSSID>.pcapng
+  -> q quit / r rescan
 
-Ausgabe der Engine-API (für Skripte):
-  Engine-Funktionen in wifi-handshake.py bleiben importierbar
+Engine API output (for scripts):
+  Engine functions in wifi-handshake.py stay importable
   (TowerConfig/TowerClient/JobStore/build_hashcat_command/...).
 ```
-

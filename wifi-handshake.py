@@ -338,14 +338,29 @@ class Handshake:
         return None
 
 
+# Actionable tips printed while a capture produces no usable EAPOL traffic.
+# Keyed by seconds of listening; each threshold prints once per capture.
+ACTION_TIPS = [
+    (30, "No EAPOL-Key: toggle the test device's Wi-Fi off and on so it reconnects."),
+    (60, "Verify the test device joins exactly this SSID and the same band "
+         "(dual-band APs often broadcast 2.4 and 5 GHz separately)."),
+    (120, "Reconnect while staying close to the access point. When idle, the AP "
+          "renews the PMK only rarely (sometimes only after an hour)."),
+    (240, "Try another device: some clients make the passive capture hard "
+          "(association in a different channel width / beacon-interval gap)."),
+]
+
+
 class CaptureStats:
-    def __init__(self, bssid, messages=(1, 2, 3, 4)):
+    def __init__(self, bssid, messages=(1, 2, 3, 4), siblings=()):
         self.bssid = bssid
         self.messages = tuple(sorted(messages))
+        self.siblings = list(siblings)
         self.total = self.target = self.target_keys = self.other_keys = 0
         self.messages_seen = collections.Counter()
         self.accepted = collections.Counter()
         self.last_hint = None
+        self._tips_done = set()
 
     def feed(self, line, accepted):
         fields = line.rstrip("\r\n").split("\t")
@@ -383,14 +398,30 @@ class CaptureStats:
         elif not self.target:
             hint = "Packets are arriving, but none match the selected BSSID. Check the AP and channel."
         elif not self.target_keys:
-            hint = "Target traffic is arriving, but no EAPOL-Key. Check which BSSID/band your test device joins."
+            hint = ("Target traffic is arriving, but no EAPOL-Key. Check which SSID and which band "
+                    "the test device joins.")
         elif not all(self.accepted[str(i)] for i in self.messages):
-            hint = ("Only part of a usable exchange has arrived. Move closer to both AP and client.")
+            hint = ("Only part of the exchange arrived. Get closer to both AP and client; "
+                    "M3/M4 in particular are often lost when a client moves or the channel is busy.")
         else:
-            hint = "The required messages have been seen, but not a matching exchange for one client, nonce and replay sequence."
+            hint = ("The required messages were seen, but no usable exchange for one client "
+                    "(nonce/replay order does not match).")
         if hint != self.last_hint:
             print(hint, flush=True)
             self.last_hint = hint
+        self._actions(elapsed)
+
+    def _actions(self, elapsed):
+        if not self.target_keys:
+            if self.siblings and 45 not in self._tips_done:
+                names = ", ".join(f"'{s['ssid']}' ({s['bssid']})" for s in self.siblings)
+                print(f"This AP also broadcasts as: {names}. If the test device joins one of "
+                      f"those, select that SSID in the network list instead.", flush=True)
+                self._tips_done.add(45)
+            for threshold, text in ACTION_TIPS:
+                if elapsed >= threshold and threshold not in self._tips_done:
+                    print(text, flush=True)
+                    self._tips_done.add(threshold)
 
 
 def check_radio(adapter, channel):
@@ -417,7 +448,27 @@ def capture_command(interface, raw, timeout, max_mb):
     return command
 
 
-def capture(adapter, network, directory, timeout, max_mb, messages=(1, 2, 3, 4)):
+def ap_base(bssid):
+    """Grouping key for multi-SSID / dual-band APs sharing one radio MAC."""
+    return ":".join(bssid.lower().split(":")[-4:])
+
+
+def same_ap_networks(networks, chosen):
+    """Other listed networks broadcast by the same physical AP as `chosen`."""
+    base = ap_base(chosen["bssid"])
+    return [n for n in networks if n["bssid"] != chosen["bssid"] and ap_base(n["bssid"]) == base]
+
+
+def choose_handshake_mode():
+    """Ask which EAPOL set to capture. M1+M2 is enough for hashcat -m 22000."""
+    print("\nEAPOL set selection:")
+    print("  1. M1+M2       (quick; enough for hashcat -m 22000) [default]")
+    print("  2. M1+M2+M3+M4 (full four-way; in practice rarely captured completely)")
+    choice = input("Choice [1]: ").strip()
+    return "m1m2m3m4" if choice == "2" else "m1m2"
+
+
+def capture(adapter, network, directory, timeout, max_mb, messages=(1, 2), siblings=()):
     run("iw", "dev", adapter.name, "set", "channel", str(network["channel"]))
     check_radio(adapter, network["channel"])
     raw = directory / "traffic.pcapng"
@@ -425,10 +476,12 @@ def capture(adapter, network, directory, timeout, max_mb, messages=(1, 2, 3, 4))
     bssid = network["bssid"]
     command = capture_command(adapter.name, raw, timeout, max_mb)
     tracker = Handshake(bssid, messages)
-    stats = CaptureStats(bssid, messages)
+    stats = CaptureStats(bssid, messages, siblings=siblings)
     wanted = "+".join(f"M{i}" for i in messages)
     print(f"\nListening on channel {network['channel']} for {network['ssid']} [{bssid}].")
     print(f"Waiting for a matching EAPOL exchange ({wanted}). Ctrl+C cancels.")
+    if set(messages) == {1, 2}:
+        print("M1+M2 are enough for hashcat -m 22000; the full four-way handshake is not required.")
     print("No packets are injected. A device must naturally connect or reconnect.")
     print("Detection is for this exact BSSID, not every AP with the same network name.")
     print(f"Temporary capture limit: {max_mb} MiB. Unrelated traffic is deleted on exit.")
@@ -1937,13 +1990,13 @@ def default_bind():
 
 def run_interactive(args):
     while True:
-        print("\nwifi-handshake - Terminal-Menue")
-        print("  1. Handshake aufnehmen  (Capture, Linux, sudo)")
-        print("  2. Tower starten        (Server + hashcat, fuer die GPU-Box)")
-        print("  3. Capture senden       (Client, an --tower URL)")
-        print("  4. Hilfe / Install      (--help, hashcat herunterladen)")
-        print("  q  Beenden")
-        choice = input("Wahl: ").strip().lower()
+        print("\nwifi-handshake - Terminal Menu")
+        print("  1. Capture handshake  (Capture, Linux, sudo)")
+        print("  2. Start tower        (Server + hashcat, for the GPU box)")
+        print("  3. Send capture       (Client, to --tower URL)")
+        print("  4. Help / Install     (--help, download hashcat)")
+        print("  q  Quit")
+        choice = input("Choice: ").strip().lower()
         if choice == "1":
             return run_capture_cli(args)
         if choice == "2":
@@ -1952,24 +2005,24 @@ def run_interactive(args):
             return serve(args)
         if choice == "3":
             if not args.tower:
-                args.tower = input("Tower URL (z.B. https://tower:8443): ").strip() or None
+                args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
             if not args.tower:
-                print("Keine Tower-URL gesetzt. Abbruch.")
+                print("No tower URL set. Aborting.")
                 continue
             if not args.send:
-                cap = input("Pfad zur Capture-Datei (.pcapng/.hc22000): ").strip()
+                cap = input("Path to capture file (.pcapng/.hc22000): ").strip()
                 args.send = Path(cap) if cap else None
             if not args.send or not Path(args.send).exists():
-                print("Keine gueltige Capture-Datei. Abbruch.")
+                print("No valid capture file. Aborting.")
                 continue
-            print("Sende Capture an", args.tower)
+            print("Sending capture to", args.tower)
             return run_headless(args)
         if choice == "4":
-            print("Installiere hashcat...")
+            print("Installing hashcat...")
             return install_tools(args.tools_dir)
         if choice in ("q", ""):
             return 0
-        print("Ungueltige Wahl.")
+        print("Invalid choice.")
 
 
 
@@ -2019,7 +2072,9 @@ Only test networks you own or have permission to test.
 
     capture = parser.add_argument_group("non-interactive capture (Linux, no TUI)")
     capture.add_argument("--run-capture", action="store_true", help="capture without the TUI")
-    capture.add_argument("--handshake", choices=("m1m2", "m1m2m3m4"), help="required EAPOL messages")
+    capture.add_argument("--handshake", choices=("m1m2", "m1m2m3m4"),
+                         help="required EAPOL messages (default: m1m2; "
+                              "m1m2 is enough for hashcat -m 22000)")
     capture.add_argument("--scan-seconds", type=int, default=20)
     capture.add_argument("--band", choices=("bg", "a", "abg"), default="abg")
     capture.add_argument("--channels", type=parse_channel_list, help="e.g. 1,6,11 or 100")
@@ -2096,6 +2151,14 @@ def run_capture_cli(args):
                     print(f"{i:3}  {strength:18} {net['channel']:3}  {net['security']:28} "
                           f"{net['bssid']}  {net['ssid']}")
                 print("\nSignal is received power, not a speed test. Security labels may be incomplete.")
+                groups = {}
+                for net in networks:
+                    groups.setdefault(ap_base(net["bssid"]), []).append(net)
+                for base, members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                    if len(members) > 1:
+                        names = ", ".join(f"'{m['ssid']}' ({m['bssid']})" for m in members)
+                        print(f"Note: {len(members)} networks belong to the same AP [...{base}]: "
+                              f"{names}. Connect the test device to exactly the SSID you pick below.")
                 answer = input("Network number, r to rescan, or q to quit: ").strip().lower()
                 if answer == "r":
                     continue
@@ -2108,9 +2171,14 @@ def run_capture_cli(args):
                 if not any(wpa in network["security"].upper() for wpa in ("WPA", "RSN")):
                     print("This network does not advertise WPA/RSN. It has no WPA four-way handshake to capture.")
                     continue
+                mode = getattr(args, "handshake", None)
+                if mode is None:
+                    mode = choose_handshake_mode()
+                messages = (1, 2) if mode == "m1m2" else (1, 2, 3, 4)
                 break
-            messages = (1, 2) if getattr(args, "handshake", None) == "m1m2" else (1, 2, 3, 4)
-            result = capture(adapter, network, directory, args.timeout, args.max_mb, messages=messages)
+            siblings = same_ap_networks(networks, network)
+            result = capture(adapter, network, directory, args.timeout, args.max_mb,
+                             messages=messages, siblings=siblings)
             if result is None:
                 return 1
             raw, frames = result
