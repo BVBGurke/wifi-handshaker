@@ -1,0 +1,33 @@
+# Downloaded toolchain (auto-fetched with --install-tools) and extracted kernels
+tools/
+kernels/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime output
+jobs/
+*.log
+
+# Captures, cracked material and hashcat state (never commit)
+*.pcap
+*.pcapng
+*.cap
+*.hccapx
+*.22000
+*.16800
+*.hc22000
+*.potfile
+*.restore
+captures/
+
+# Wordlists and rules (large / user-supplied)
+wordlists/
+*.dict
+*.wordlist
+*.rule
+*.hcmask
