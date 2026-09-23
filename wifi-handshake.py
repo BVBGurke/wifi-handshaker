@@ -670,6 +670,85 @@ def discover_tools(config):
     return tools
 
 
+BACKEND_IGNORE_FLAGS = {
+    "cuda": "--backend-ignore-cuda",
+    "hip": "--backend-ignore-hip",
+    "opencl": "--backend-ignore-opencl",
+    "metal": "--backend-ignore-metal",
+}
+BACKEND_ORDER = ("cuda", "hip", "metal", "opencl")
+
+
+def detect_backends(hashcat):
+    """Parse `hashcat -I` into {backend: [{id, type, name}]}.
+
+    hashcat must run from its own directory so it can load the ./OpenCL kernels.
+    """
+    if hashcat is None:
+        return {}
+    try:
+        result = subprocess.run([str(hashcat), "-I"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace", timeout=90,
+                                cwd=str(Path(hashcat).resolve().parent))
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    backends, current, device = {}, None, None
+    for line in result.stdout.splitlines():
+        header = re.match(r"^\s*(CUDA|HIP|OpenCL|Metal|oneAPI) Info:", line)
+        if header:
+            current = header.group(1).lower()
+            backends.setdefault(current, [])
+            device = None
+            continue
+        start = re.match(r"^\s*Backend Device ID #(\d+)", line)
+        if start and current is not None:
+            device = {"id": int(start.group(1))}
+            backends[current].append(device)
+            continue
+        if device is not None:
+            field = re.match(r"^\s*([A-Za-z][A-Za-z ]*?)\s*\.+\s*:\s*(.+?)\s*$", line)
+            if field:
+                device[field.group(1).strip().lower()] = field.group(2)
+    return backends
+
+
+def preferred_backend(backends):
+    """Pick the GPU backend: CUDA for NVIDIA, HIP/OpenCL for AMD, OpenCL for Intel."""
+    for name in BACKEND_ORDER:
+        if any(_is_gpu(name, device) for device in backends.get(name, [])):
+            return name
+    return None
+
+
+def _is_gpu(backend, device):
+    kind = (device.get("type") or "").lower()
+    if kind:
+        return "gpu" in kind
+    # CUDA/HIP/Metal sections omit Type; their devices are always GPUs.
+    return backend in ("cuda", "hip", "metal")
+
+
+def backend_flags(chosen, available=None):
+    """Ignore every detected backend except the chosen one.
+
+    Only backends that hashcat actually reported are ignored, so we never pass
+    an --backend-ignore-* flag for a backend this build does not support.
+    """
+    if not chosen:
+        return []
+    names = list(BACKEND_IGNORE_FLAGS) if available is None else list(available)
+    return [BACKEND_IGNORE_FLAGS[name] for name in names
+            if name in BACKEND_IGNORE_FLAGS and name != chosen]
+
+
+def backend_summary(backends):
+    lines = []
+    for name in BACKEND_ORDER:
+        for device in backends.get(name, []):
+            lines.append(f"{name.upper()} {device.get('type', 'GPU')}: {device.get('name', 'unknown')}")
+    return lines
+
+
 def resolve_named(name, directories, suffixes):
     """Resolve a client-supplied wordlist/rule name against configured folders."""
     if not name or not isinstance(name, str):
@@ -721,7 +800,8 @@ def sanitize_extra_args(args):
     return clean_args
 
 
-def build_hashcat_command(hashcat, hash_file, attack, out_file, potfile, config):
+def build_hashcat_command(hashcat, hash_file, attack, out_file, potfile, config,
+                          backend=None, available_backends=None):
     attack = attack or {}
     kind = attack.get("type", "dictionary")
     command = [str(hashcat), "-m", HASHCAT_MODE, str(hash_file),
@@ -748,6 +828,10 @@ def build_hashcat_command(hashcat, hash_file, attack, out_file, potfile, config)
                     str(resolve_named(attack.get("wordlist2"), config.wordlist_dirs, WORDLIST_SUFFIXES))]
     else:
         raise RuntimeError(f"Unknown attack type: {kind}")
+    chosen = str(attack.get("backend") or backend or "").lower()
+    if chosen not in BACKEND_IGNORE_FLAGS:
+        chosen = backend if backend in BACKEND_IGNORE_FLAGS else None
+    command += backend_flags(chosen, available_backends)
     command += sanitize_extra_args(attack.get("extra_args"))
     return command
 
@@ -1142,7 +1226,9 @@ class TowerWorker(threading.Thread):
                                    clean((result.stdout or "")[-400:]))
         out_file = job_dir / "cracked.txt"
         command = build_hashcat_command(hashcat, hash_file, job["attack"], out_file,
-                                        self.config.potfile, self.config)
+                                        self.config.potfile, self.config,
+                                        self.tools.get("backend"),
+                                        list(self.tools.get("backends") or {}))
         self.store.update(job_id, state="running", command=[str(part) for part in command])
         last_save = 0.0
         with (job_dir / "hashcat.log").open("w", encoding="utf-8") as log:
@@ -1168,6 +1254,9 @@ class TowerWorker(threading.Thread):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+                # hashcat writes <session>.log next to its executable; we keep
+                # our own copy in the job folder, so drop the stray one.
+                (Path(hashcat).resolve().parent / "tower.log").unlink(missing_ok=True)
                 with self.proc_lock:
                     self.procs.pop(job_id, None)
         if self.store.is_cancelled(job_id):
@@ -1218,6 +1307,8 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
                 "hashcat": str(hashcat) if hashcat else None,
                 "hashcat_version": self.tools.get("hashcat_version"),
                 "hcxpcapngtool": str(self.tools["hcxpcapngtool"]) if self.tools.get("hcxpcapngtool") else None,
+                "backend": self.tools.get("backend"),
+                "devices": backend_summary(self.tools.get("backends") or {}),
                 "queue": len(self.store.queue)}
 
     def do_GET(self):
@@ -1315,6 +1406,10 @@ def serve(args):
         directory.mkdir(parents=True, exist_ok=True)
     tools = discover_tools(config)
     print(f"Tower tools: hashcat={tools.get('hashcat')} hcxpcapngtool={tools.get('hcxpcapngtool')}")
+    devices = backend_summary(tools.get("backends") or {})
+    print(f"GPU backend: {tools.get('backend') or 'auto (none detected)'}")
+    for line in devices:
+        print("  " + line)
     if not tools.get("hashcat"):
         print("WARNING: hashcat not found. Jobs will fail until it is installed (--install-tools).")
     store = JobStore(config.jobs_dir)
@@ -1712,6 +1807,19 @@ def self_test():
     assert ws_frame(b"hi") == b"\x81\x02hi"
     assert ws_frame(b"x" * 200)[:2] == b"\x81\x7e"
     assert ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    # Tower: GPU backend selection.
+    assert preferred_backend({"cuda": [{"id": 1, "name": "NVIDIA GeForce RTX 4070 SUPER"}],
+                              "opencl": [{"id": 2, "type": "GPU", "name": "NVIDIA GeForce RTX 4070 SUPER"}]}) == "cuda"
+    assert preferred_backend({"opencl": [{"id": 1, "type": "GPU", "name": "AMD Radeon RX 7900"}]}) == "opencl"
+    assert preferred_backend({"hip": [{"id": 1, "type": "GPU", "name": "AMD Radeon"}]}) == "hip"
+    assert preferred_backend({"opencl": [{"id": 1, "type": "CPU", "name": "Intel CPU"}]}) is None
+    assert preferred_backend({}) is None
+    assert "--backend-ignore-opencl" in backend_flags("cuda")
+    assert "--backend-ignore-cuda" not in backend_flags("cuda")
+    assert backend_flags("cuda", ["cuda", "opencl"]) == ["--backend-ignore-opencl"]
+    assert backend_flags("cuda", ["cuda"]) == []
+    assert backend_flags(None) == []
+    assert detect_backends(None) == {}
     # Tower: job store round-trip and attack command building.
     with tempfile.TemporaryDirectory(prefix="tower-store-") as tmp:
         store = JobStore(tmp)
