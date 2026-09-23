@@ -484,6 +484,22 @@ def _socks5_recv_exact(sock, size):
     return bytes(chunks)
 
 
+def _socks5_address(host):
+    """Encode a destination host for a SOCKS5 CONNECT as ``(atyp, payload)``.
+
+    ATYP 1 = IPv4, ATYP 3 = domain name (MagicDNS/tailnet hostnames need
+    this), ATYP 4 = IPv6. Raises ``OSError`` when the host cannot be encoded.
+    """
+    if ":" in host:
+        return 4, socket.inet_pton(socket.AF_INET6, host)
+    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
+        return 1, socket.inet_aton(host)
+    encoded = host.encode("idna")
+    if not 0 < len(encoded) < 256:
+        raise OSError(f"Invalid SOCKS5 domain: {host!r}")
+    return 3, bytes([len(encoded)]) + encoded
+
+
 def _socks5_connect(proxy, host, port, timeout):
     """Connect ``host:port`` through a SOCKS5 proxy and return the socket."""
     proxy_host, proxy_port = proxy
@@ -493,11 +509,8 @@ def _socks5_connect(proxy, host, port, timeout):
         sock.sendall(b"\x05\x01\x00")  # SOCKS5, one method: no authentication
         if _socks5_recv_exact(sock, 2) != b"\x05\x00":
             raise OSError("SOCKS5 proxy rejected no-auth.")
-        if ":" in host:
-            address = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
-        else:
-            address = b"\x01" + socket.inet_aton(host)
-        sock.sendall(b"\x05\x01\x00" + address + struct.pack(">H", port))
+        atyp, address = _socks5_address(host)
+        sock.sendall(b"\x05\x01\x00" + bytes([atyp]) + address + struct.pack(">H", port))
         header = _socks5_recv_exact(sock, 4)
         if header[1] != 0:
             raise OSError("SOCKS5 connect failed.")
@@ -514,6 +527,15 @@ def _socks5_connect(proxy, host, port, timeout):
         raise
 
 
+def _enable_keepalive(sock):
+    """Enable TCP keepalive so idle WebSocket/HTTP connections notice a dead peer."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    return sock
+
+
 def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
     """Return ``(connected_socket, connect_ms)``, trying direct then SOCKS5.
 
@@ -524,7 +546,7 @@ def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
     last_error = None
     try:
         started = time.monotonic()
-        sock = socket.create_connection((host, port), timeout=timeout)
+        sock = _enable_keepalive(socket.create_connection((host, port), timeout=timeout))
         return sock, (time.monotonic() - started) * 1000.0
     except OSError as exc:
         last_error = exc
@@ -532,7 +554,7 @@ def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
     if proxy:
         try:
             started = time.monotonic()
-            sock = _socks5_connect(proxy, host, port, timeout)
+            sock = _enable_keepalive(_socks5_connect(proxy, host, port, timeout))
             return sock, (time.monotonic() - started) * 1000.0
         except OSError as exc:
             last_error = exc
@@ -2949,7 +2971,8 @@ class TowerClient:
             raise RuntimeError("Host presented no certificate.")
         digest = hashlib.sha256(der).hexdigest()
         self.last_fingerprint = digest
-        expected = (self.fingerprint or known_fingerprint(self.host, self.port) or "").replace(":", "").lower()
+        expected = (os.environ.get("WIFI_HANDSHAKE_TOWER_FINGERPRINT", "")
+                    or self.fingerprint or known_fingerprint(self.host, self.port) or "").replace(":", "").lower()
         if not expected:
             if not self.confirm(digest):
                 raise RuntimeError("Host certificate not trusted.")
@@ -2958,23 +2981,32 @@ class TowerClient:
         if digest.lower() != expected:
             raise RuntimeError(f"Certificate fingerprint mismatch. Expected {expected}, got {digest}.")
 
+    def _socket_factory(self, address, connect_timeout=None, source_address=None, **kwargs):
+        # http.client hook: connect through open_socket so the userspace
+        # Tailscale SOCKS5 fallback is used for the real client traffic too
+        # (direct first, SOCKS5 when the tailnet IP is not routable).
+        timeout = connect_timeout or self.timeout
+        return open_socket(self.host, self.port, timeout)[0]
+
     def _open_socket(self):
-        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        raw, _elapsed = open_socket(self.host, self.port, self.timeout)
         if self.scheme == "https":
             sock = self._context().wrap_socket(raw, server_hostname=self.host)
             self._verify_peer(sock)
             return sock
         return raw
 
-    def request(self, method, path, body=None, headers=None):
+    def _request_once(self, method, path, body=None, headers=None):
         if self.scheme == "https":
             conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout,
                                                context=self._context())
-            conn.connect()
-            self._verify_peer(conn.sock)
         else:
             conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        conn._create_connection = self._socket_factory
         try:
+            conn.connect()
+            if self.scheme == "https":
+                self._verify_peer(conn.sock)
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
             data = response.read()
@@ -2983,6 +3015,22 @@ class TowerClient:
             return json.loads(data.decode()) if data else {}
         finally:
             conn.close()
+
+    def request(self, method, path, body=None, headers=None, retries=2):
+        """Perform a request, retrying transient network failures with backoff.
+
+        Only connection-level errors (OSError/HTTPException) are retried;
+        HTTP errors and certificate/trust failures are raised immediately.
+        """
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                return self._request_once(method, path, body=body, headers=headers)
+            except (OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                if attempt < retries:
+                    time.sleep(min(0.5 * (2 ** attempt), 3.0))
+        raise RuntimeError(f"Host {self.base()} unreachable: {clean(str(last_error))}")
 
     def health(self):
         return self.request("GET", "/api/v1/health")
@@ -2995,7 +3043,9 @@ class TowerClient:
         headers = {"Content-Type": "application/octet-stream",
                    "X-Attack": base64.b64encode(json.dumps(attack).encode()).decode(),
                    "X-Filename": Path(capture_path).name}
-        return self.request("POST", "/api/v1/jobs", body=body, headers=headers)
+        # POST is not idempotent: never auto-retry, or a lost response could
+        # create a duplicate job on the host.
+        return self.request("POST", "/api/v1/jobs", body=body, headers=headers, retries=0)
 
     def job(self, job_id):
         return self.request("GET", f"/api/v1/jobs/{job_id}")["job"]
@@ -3110,13 +3160,25 @@ def watch_job(client, job_id, tower_url):
             print_job_line(job)
 
     streamed = client.stream_events(job_id, on_status)
-    job = client.job(job_id)
+    try:
+        job = client.job(job_id)
+    except RuntimeError as exc:
+        print(f"Connection to the host was lost: {exc}")
+        print("The job keeps running on the host. Reattach later with "
+              f"--tower {tower_url} --watch {job_id}")
+        return 0
     deadline = time.monotonic() + 1800
     while job.get("state") not in ("done", "failed", "cancelled") and time.monotonic() < deadline:
         if not streamed:
             print_job_line(job)
         time.sleep(3)
-        job = client.job(job_id)
+        try:
+            job = client.job(job_id)
+        except RuntimeError as exc:
+            print(f"Connection to the host was lost: {exc}")
+            print("The job keeps running on the host. Reattach later with "
+                  f"--tower {tower_url} --watch {job_id}")
+            return 0
     if job.get("state") not in ("done", "failed", "cancelled"):
         print(f"Still running. Reattach with: --tower {tower_url} --watch {job_id}")
         return 0
@@ -3338,6 +3400,156 @@ def self_test():
     assert ws_frame(b"hi") == b"\x81\x02hi"
     assert ws_frame(b"x" * 200)[:2] == b"\x81\x7e"
     assert ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    # Tailscale transport: SOCKS5 destination encoding (IPv4/domain/IPv6).
+    assert _socks5_address("1.2.3.4") == (1, socket.inet_aton("1.2.3.4"))
+    assert _socks5_address("2001:db8::1")[0] == 4
+    _typ3, _payload = _socks5_address("jannistower.tailnet")
+    assert _typ3 == 3 and _payload[0] == len(b"jannistower.tailnet")
+    assert _payload[1:] == b"jannistower.tailnet"
+    # TCP keepalive is enabled on the sockets we hand out.
+    with socket.socket() as _keep:
+        _enable_keepalive(_keep)
+        assert _keep.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+    # Pinning: an explicit fingerprint override (env) beats TOFU and a
+    # mismatch is raised even when the interactive confirm would accept.
+    class _FakeTLS:
+        def getpeercert(self, binary_form=False):
+            return b"\x30\x03\x02\x01\x00"
+    os.environ["WIFI_HANDSHAKE_TOWER_FINGERPRINT"] = "aa" * 32
+    try:
+        _pinned = TowerClient("https://127.0.0.1:1", confirm=lambda digest: True)
+        try:
+            _pinned._verify_peer(_FakeTLS())
+            raise AssertionError("fingerprint override ignored")
+        except RuntimeError as exc:
+            assert "mismatch" in str(exc)
+        _expected = hashlib.sha256(b"\x30\x03\x02\x01\x00").hexdigest()
+        os.environ["WIFI_HANDSHAKE_TOWER_FINGERPRINT"] = _expected
+        _pinned._verify_peer(_FakeTLS())  # matches -> no exception
+        assert _pinned.last_fingerprint == _expected
+    finally:
+        del os.environ["WIFI_HANDSHAKE_TOWER_FINGERPRINT"]
+    # The client retries transient connection failures and fails with a
+    # clear message against a dead host.
+    try:
+        TowerClient("http://127.0.0.1:9", insecure=True, timeout=1).request("GET", "/x", retries=1)
+        raise AssertionError("dead host did not fail")
+    except RuntimeError as exc:
+        assert "unreachable" in str(exc)
+    # A real in-process SOCKS5 proxy proves the client traffic is routable
+    # through the userspace Tailscale fallback (direct + SOCKS5).
+    def _socks_address_class(address_bytes):
+        _b, = address_bytes[3:4]
+        return _b
+
+    class _TinySocks5:
+        def __init__(self):
+            self.listener = socket.socket()
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.bind(("127.0.0.1", 0))
+            self.listener.listen(8)
+            self.port = self.listener.getsockname()[1]
+            threading.Thread(target=self._serve, daemon=True).start()
+
+        def _serve(self):
+            while True:
+                try:
+                    conn, _ = self.listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+        @staticmethod
+        def _recv_exact(sock, size):
+            data = bytearray()
+            while len(data) < size:
+                chunk = sock.recv(size - len(data))
+                if not chunk:
+                    raise OSError("proxy: early close")
+                data += chunk
+            return bytes(data)
+
+        def _handle(self, conn):
+            try:
+                conn.settimeout(10)
+                if self._recv_exact(conn, 3) != b"\x05\x01\x00":
+                    return
+                conn.sendall(b"\x05\x00")
+                atyp = _socks_address_class(self._recv_exact(conn, 4))
+                if atyp == 1:
+                    host = socket.inet_ntoa(self._recv_exact(conn, 4))
+                elif atyp == 4:
+                    host = socket.inet_ntop(socket.AF_INET6, self._recv_exact(conn, 16))
+                else:
+                    size, = self._recv_exact(conn, 1)
+                    host = self._recv_exact(conn, size).decode("idna")
+                port, = struct.unpack(">H", self._recv_exact(conn, 2))
+                target = socket.create_connection((host, port), timeout=10)
+                conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                with conn, target:
+                    conn.setblocking(False)
+                    target.setblocking(False)
+                    selector = selectors.DefaultSelector()
+                    selector.register(conn, selectors.EVENT_READ, target)
+                    selector.register(target, selectors.EVENT_READ, conn)
+                    while True:
+                        for key, _ in selector.select(timeout=20):
+                            try:
+                                if not selector.get_key(key.fileobj):
+                                    continue
+                            except KeyError:
+                                continue
+                            chunk = key.fileobj.recv(65536)
+                            if not chunk:
+                                return
+                            key.data.sendall(chunk)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    class _HealthHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/api/v1/health":
+                body = json.dumps({"ok": True, "hostname": "self-test"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    _tiny = _TinySocks5()
+    _httpd = http.server.HTTPServer(("127.0.0.1", 0), _HealthHandler)
+    threading.Thread(target=_httpd.serve_forever, daemon=True).start()
+    _real_proxy = tailscale_proxy
+    _real_open = open_socket
+
+    def _forced_proxy():
+        return "127.0.0.1", _tiny.port
+
+    def _forced_open(host, port, timeout=TOWER_PROBE_TIMEOUT):
+        # Force the SOCKS5 path (a direct loopback connect would succeed and
+        # bypass the proxy, so route like userspace Tailscale mode does).
+        return _socks5_connect(_forced_proxy(), host, port, timeout), 1.0
+
+    globals()["tailscale_proxy"] = lambda: _forced_proxy()
+    globals()["open_socket"] = _forced_open
+    try:
+        _socks_client = TowerClient("http://127.0.0.1:{}".format(_httpd.server_port), insecure=True)
+        assert _socks_client.health().get("ok") is True
+    finally:
+        globals()["tailscale_proxy"] = _real_proxy
+        globals()["open_socket"] = _real_open
+        _httpd.shutdown()
+        _tiny.listener.close()
     # Tower: GPU backend selection.
     assert preferred_backend({"cuda": [{"id": 1, "name": "NVIDIA GeForce RTX 4070 SUPER"}],
                               "opencl": [{"id": 2, "type": "GPU", "name": "NVIDIA GeForce RTX 4070 SUPER"}]}) == "cuda"

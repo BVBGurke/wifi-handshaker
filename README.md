@@ -215,6 +215,49 @@ WIFI_HANDSHAKE_TAILSCALE_SOCKET=/run/user/1000/tailscaled.sock \
   python wifi-handshake.py --tailscale-status
 ```
 
+### How the Tailscale connection works (+ protection)
+
+Every connection to a host tries **direct TCP first** (works with a normal,
+rootful Tailscale install: the `100.x.y.z` tailnet IP is routed by the kernel
+TUN device) and falls back to the **tailnet SOCKS5 proxy** when the direct path
+fails (userspace / root-less mode, e.g. the laptop in the systemd-user example
+above).
+
+```
+direct:  TCP -> 100.x.y.z:8443        (tailscaled with /dev/net/tun)
+fallback: TCP -> 127.0.0.1:1056       (tailscaled --tun=userspace-networking,
+         SOCKS5 CONNECT 100.x.y.z:8443  --socks5-server=127.0.0.1:1056)
+```
+
+* The proxy is auto-detected on `127.0.0.1:1056` (the tailscaled default) or
+  overridden with `WIFI_HANDSHAKE_TAILSCALE_PROXY=socks5://host:port`.
+* SOCKS5 destinations are sent as **domain names** (ATYP 3) when the target is
+  a tailnet/MagicDNS hostname (e.g. `jannistower`), so name-based `--tower`
+  URLs work in userspace mode too — the proxy resolves the name in the tailnet.
+* Every socket gets **TCP keepalive** enabled, so a silent tailnet drop on a
+  long-running `--watch` WebSocket is noticed instead of hanging forever.
+* Client requests **retry transient failures** (connection refused/reset) with
+  exponential backoff (0.5s → 1s → 2s) instead of aborting on a tailnet blip;
+  `--watch` prints a clear message and points to the reattach command when the
+  host becomes unreachable.
+
+TLS protection (matching the official Tailscale userspace networking docs for
+`--socks5-server` and `--outbound-http-proxy-listen`; see
+[userspace-networking](https://tailscale.com/kb/1112/userspace-networking) and
+[tailscaled](https://tailscale.com/docs/reference/tailscaled)):
+
+* HTTPS default, self-signed certificate auto-generated on the host, SHA-256
+  **fingerprint pinning** (TOFU) on first contact, stored in
+  `~/.wifi-handshake/known_hosts.json`, verified on every request.
+* For automation you can pin explicitly instead of trusting the first contact:
+  ```
+  WIFI_HANDSHAKE_TOWER_FINGERPRINT=aa... <sha256 of the host cert> \
+    python wifi-handshake.py --tower https://jannistower:8443 --send cap.pcapng
+  ```
+* `--insecure` is the only way to switch verification off; the tailnet
+  (WireGuard) still authenticates and encrypts the whole tunnel as a second,
+  independent layer.
+
 ### Configuration (`~/.wifi-handshake/config.json`)
 
 Optional settings that are read automatically on every run:
