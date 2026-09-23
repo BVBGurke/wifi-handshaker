@@ -397,11 +397,112 @@ def choose_tailscale_tower(args):
     return args.tower
 
 
+TOWER_PROBE_TIMEOUT = 1.5
+
+
+def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
+    """Return ``(scheme, health)`` if a tower answers at host:port, else None.
+
+    Tries HTTPS first (the tower uses a self-signed certificate, so peer
+    verification is disabled for the probe) and then plain HTTP. Only a valid
+    health payload counts as a tower, so unrelated services are ignored.
+    """
+    for scheme in ("https", "http"):
+        conn = None
+        try:
+            if scheme == "https":
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn.request("GET", "/api/v1/health")
+            response = conn.getresponse()
+            data = response.read()
+            if response.status == 200:
+                payload = json.loads(data.decode())
+                if isinstance(payload, dict) and payload.get("ok") is True:
+                    return scheme, payload
+        except (OSError, ssl.SSLError, http.client.HTTPException, ValueError):
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+    return None
+
+
+def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
+    """Probe every online tailnet peer for a running tower.
+
+    Returns a list of peer dicts extended with ``scheme``, ``url`` and the
+    ``health`` payload of each responding tower.
+    """
+    status = status or tailscale_status()
+    if not tailscale_ready(status):
+        return []
+    found = []
+    for peer in status["peers"]:
+        if not peer["online"]:
+            continue
+        host = peer["ip"] or peer["dns_name"]
+        if not host:
+            continue
+        probe = probe_tower(host, port, timeout)
+        if probe is None:
+            continue
+        scheme, health = probe
+        found.append({**peer, "scheme": scheme, "health": health,
+                      "url": f"{scheme}://{host}:{port}"})
+    return found
+
+
+def print_tailnet_towers(towers):
+    if not towers:
+        info("No running tower found in the tailnet.")
+        return
+    print(style(f"  {'#':>3}  {'Host':<24} {'Backend':<12} URL", "bold"))
+    for index, tower in enumerate(towers, 1):
+        backend = tower["health"].get("backend") or "auto"
+        print(f"  {index:>3}  {tower['hostname'][:23]:<24} {str(backend)[:11]:<12} {tower['url']}")
+
+
+def connect_tailnet_tower(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
+    """Scan the tailnet for a running tower and set ``args.tower`` to it.
+
+    A peer matching ``--tower-name`` is preferred; otherwise the first
+    reachable tower is used. Returns the URL or None.
+    """
+    status = tailscale_status()
+    if not tailscale_ready(status):
+        return None
+    port = port or getattr(args, "port", DEFAULT_PORT)
+    heading("Scanning the tailnet for running towers")
+    towers = discover_tailnet_towers(port, status, timeout)
+    print_tailnet_towers(towers)
+    if not towers:
+        return None
+    wanted = getattr(args, "tower_name", None)
+    chosen = None
+    if wanted:
+        chosen = next((tower for tower in towers if wanted.lower() in
+                       (tower["hostname"].lower(), tower["dns_name"].lower())), None)
+    if chosen is None:
+        chosen = towers[0]
+    args.tower = chosen["url"]
+    ok(f"Connected to tower {chosen['hostname']} at {chosen['url']}")
+    return args.tower
+
+
 def resolve_tower(args, name=None):
     """Fill in ``args.tower`` from the tailnet when it was not set explicitly.
 
-    Discovery is only attempted when a tower name is known: either the
-    ``--tower-name`` value or the default ``tower``. Returns the URL or None.
+    First tries the named peer (``--tower-name`` or the default ``tower``).
+    When no such peer exists, the whole tailnet is scanned for a running tower
+    and the first reachable one is connected automatically. Returns the URL.
     """
     if getattr(args, "tower", None):
         return args.tower
@@ -413,7 +514,7 @@ def resolve_tower(args, name=None):
         ok(f"Found tailnet peer '{wanted}': {url}")
         args.tower = url
         return url
-    return None
+    return connect_tailnet_tower(args)
 
 
 def prompt_tower(args):
@@ -2971,11 +3072,14 @@ def run_interactive(args):
             continue
         if choice == "7":
             print_tailscale_status()
-            answer = input("Action: [Enter] back, l to log in, t to pick a tower: ").strip().lower()
+            answer = input("Action: [Enter] back, l to log in, t to pick a peer, "
+                           "d to scan + connect a tower: ").strip().lower()
             if answer == "l":
                 tailscale_login()
             elif answer == "t":
                 choose_tailscale_tower(args)
+            elif answer == "d":
+                connect_tailnet_tower(args)
             continue
         if choice in ("q", ""):
             return 0
@@ -3003,6 +3107,7 @@ def build_parser():
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW  # verify MIC
   python wifi-handshake.py --download-captures   # fetch example captures
   python wifi-handshake.py --tailscale-status    # show the tailnet and peers
+  python wifi-handshake.py --discover-towers     # scan the tailnet for running towers
   python wifi-handshake.py --send cap.pcapng --tower-name tower  # find tower via Tailscale
 
 Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the tower
@@ -3070,6 +3175,8 @@ Only test networks you own or have permission to test.
                            help="print tailnet status and peers, then exit")
     tailscale.add_argument("--tailscale-login", action="store_true",
                            help="join the tailnet (`tailscale up`), then exit")
+    tailscale.add_argument("--discover-towers", action="store_true",
+                           help="scan tailnet peers for running towers, then exit")
     return parser
 
 
@@ -3269,6 +3376,12 @@ def main(argv=None):
             return tailscale_login()
         if args.tailscale_status:
             print_tailscale_status()
+            return 0
+        if args.discover_towers:
+            if not tailscale_ready():
+                warn("Tailscale is not running. Start it with `sudo tailscale up`.")
+                return 1
+            print_tailnet_towers(discover_tailnet_towers(args.port))
             return 0
         headless = run_headless(args)
         if headless is not None:

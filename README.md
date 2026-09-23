@@ -146,7 +146,8 @@ python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
 `--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
-`--tower-name NAME`, `--tailscale-status`, `--tailscale-login`.
+`--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
+`--discover-towers`.
 
 ### Tailscale (tower discovery)
 
@@ -157,6 +158,7 @@ The tower does not need a public address: put both machines in the same
 ```
 python wifi-handshake.py --tailscale-status   # show this node and all peers
 python wifi-handshake.py --tailscale-login    # join the tailnet (`tailscale up`)
+python wifi-handshake.py --discover-towers    # scan peers for a running tower
 python wifi-handshake.py --send capture.pcapng --tower-name tower
 ```
 
@@ -164,9 +166,14 @@ python wifi-handshake.py --send capture.pcapng --tower-name tower
 numbered list of peers. `--tower-name NAME` looks that peer up by its hostname
 and builds the tower URL from its **tailnet IP**, e.g.
 `https://100.x.y.z:<port>` (the default name when discovering is `tower`).
-Without `--tower`, an upload (`--send`/`--watch`) also falls back to discovering
-a peer named `tower`. Menu item **7 – Tailscale** does all of this interactively
-and lets you store a peer as the tower for later sends.
+
+**Auto-discovery:** `--discover-towers` probes every online peer on the tower
+port and performs the tower **health handshake** (`/api/v1/health`), so only
+peers that really run the tower are listed. When no peer matches `--tower-name`,
+an upload (`--send`/`--watch`) falls back to scanning the tailnet and connecting
+to the first reachable tower automatically. Menu item **7 – Tailscale** offers
+this as action **d** (scan + connect) and lets you store a peer as the tower for
+later sends.
 
 `--serve` prints the tailnet IP the tower is reachable at, e.g.
 `use: --tower https://100.x.y.z:8443`.
