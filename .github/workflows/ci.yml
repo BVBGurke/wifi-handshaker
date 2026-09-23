@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  self-test:
+    name: Self-test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile check
+        run: python -m py_compile wifi-handshake.py
+
+      # Pure-Python test: no radio, no root, no tshark/hcxtools needed.
+      # Covers the built-in pcap -> hc22000 converter and MIC verification on
+      # the committed example capture. Installing tshark locally enables the
+      # full suite (offline packet decoding, synthetic stdin capture).
+      - name: Engine self-test
+        run: python wifi-handshake.py --self-test
+
+      - name: Help page renders
+        run: python wifi-handshake.py --help >/dev/null
