@@ -38,7 +38,19 @@ from a shell (`--run-capture`).
 ## 2. Requirements
 
 ### Laptop (Linux)
-* WLAN card with **monitor mode** (dedicated radio, no shared PHY).
+* WLAN card with **monitor mode**. Monitor mode is a driver/firmware
+  capability — the software cannot add it. Check your card with:
+  ```
+  iw phy | grep -A1 "Supported interface modes"    # look for "monitor"
+  ```
+  Known to work on Linux (monitor mode): Atheros `ath9k`/`ath9k_htc`
+  (AR9271, AR9000), MediaTek `mt76` (MT7601, MT7612U, MT7921), Realtek
+  `rtw88` (RTL8723DE, RTL8821CE, 2.4 GHz only) and `rtl88xxau`
+  (RTL8811AU/RTL8812AU/RTL8814AU), and many Intel cards (monitor yes,
+  injection usually no). Many **Broadcom** onboard chips and some older Intel
+  parts cannot monitor at all.
+* Ideally a **dedicated radio** (no shared PHY) so your normal Wi-Fi stays up.
+  The tool warns if another interface shares the radio.
 * Internet **in parallel** to sniffing, e.g. via **USB tethering** from a phone.
 * Packages:
   ```
@@ -92,12 +104,24 @@ Without arguments `wifi-handshake.py` starts an interactive terminal menu:
 
 ```
 wifi-handshake - Terminal Menu
-  1. Capture handshake  (Capture, Linux, sudo)
-  2. Start tower        (Server + hashcat, for the GPU box)
-  3. Send capture       (Client, to --tower URL)
+  1. Capture handshake  (Linux, monitor mode, root)
+  2. Start tower        (server + hashcat, for the GPU box)
+  3. Send capture       (client, to --tower URL)
   4. Help / Install     (--help, download hashcat)
+  5. Inspect capture    (offline: find/verify a handshake in a file)
+  6. Example captures   (download public test data)
   q  Quit
 ```
+
+The menu stays open after each action. After a successful capture it asks
+whether to send the file to the tower right away (menu item 1 → capture →
+"Send this capture to a tower now? [y/N]"). When run without root, the
+`sudo` password is asked **once** at the start of the capture and kept alive
+in the background, so long captures never prompt again; the capture itself runs
+as a child process, so the menu survives.
+
+The whole interface is **English-only by project rule** (enforced by a comment
+at the top of `wifi-handshake.py`).
 
 Run modes without the menu:
 
@@ -115,7 +139,32 @@ python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 ```
 Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
-`--serve`, `--self-test`.
+`--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`.
+
+### Offline inspection and example captures
+
+A capture can be checked **without a radio or root** — useful before uploading it
+to the tower, and for testing the parser against known-good data:
+
+```
+python wifi-handshake.py --inspect capture.pcapng
+python wifi-handshake.py --inspect capture.pcapng --essid MyNetwork --password secret123
+```
+
+`--inspect` finds four-way handshakes with the same parser the live capture uses.
+With `--essid` and `--password` it also derives the PTK (PBKDF2 + the 802.11 PRF)
+and **verifies the M2/M4 MIC**, i.e. proves the handshake is complete and usable.
+
+`--download-captures` fetches the public example captures from
+[`vanhoefm/wifi-example-captures`](https://github.com/vanhoefm/wifi-example-captures)
+into `./test-captures` (or a directory you pass). When those files are present,
+`--self-test` additionally verifies the documented WPA2 example, so the crypto
+path is covered by a real capture. Use `--captures-repo owner/repo` to point at a
+different repository of `.pcap`/`.pcapng` files.
+
+The scan list also shows a **Cl** column (associated clients seen in the
+airodump CSV). APs with clients are the best passive targets: they rekey when
+their own devices reconnect, no deauthentication needed.
 
 ### Step 1 – Start the tower (Windows)
 Via menu item **2 – Start tower** or directly:
@@ -133,11 +182,22 @@ A self-signed certificate is created automatically on first start
 
 ### Step 2 – Capture a handshake (Laptop)
 Via menu item **1 – Capture handshake** (or `--run-capture`):
+
+The adapter is put into monitor mode automatically, using the most compatible
+path available: an interface that is already in monitor mode is reused; if the
+managed interface cannot be switched directly, a dedicated monitor interface is
+created (`iw phy <phy> interface add ... type monitor`). If neither works, the
+card genuinely does not support monitor mode. The original mode/state is
+restored afterwards.
+
 1. Choose the EAPOL set: `--handshake m1m2` (fast, enough for `hashcat -m 22000`)
    or `--handshake m1m2m3m4` (full four-way). **`m1m2` is the default** because
    M3/M4 are frequently lost in practice and hashcat only needs M1+M2.
 2. Choose the adapter (monitor mode, dedicated radio).
-3. Confirm with `YES` to start the scan; pick a network from the list. If the
+3. Confirm with `YES` to start the scan; pick a network from the list. The scan
+   band defaults to `abg` (2.4 + 5 GHz); use `--band 6` (or `abg6`) for Wi-Fi 6E
+   and `--channels 1,6,11` / `--channels 5180` to restrict channels or
+   frequencies. If the
    scanner lists several SSIDs of the same access point (same AP base MAC), a
    note tells you so — connect the test device to exactly the SSID you pick.
 4. Wait for a matching exchange (a device must reconnect). The tool prints
@@ -216,6 +276,9 @@ long as a GPU is present.
 
 `X-Attack` is Base64-encoded JSON of the attack parameters.
 
+Uploads are limited to 64 MiB by default (changeable with `--max-upload-mb`
+on the tower; `options: --tower URL, --serve, --port N, --max-upload-mb ...`).
+
 ---
 
 ## 8. Storage & files
@@ -266,6 +329,7 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 | `Upload is a raw capture but hcxpcapngtool is not available` | `hcxtools` is missing on the tower (no Windows binary). Install `pacman -S hcxtools` on the laptop — the client then converts locally. |
 | `Unknown or disallowed file: x.txt` | wordlist is not in a tower wordlist folder. |
 | `Certificate fingerprint mismatch` | certificate of the tower was recreated. Adjust `known_hosts.json` or connect with `--insecure`. |
+| Upload always fails / "connection reset" | old towers crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the tower with this build; the limit now defaults to 64 MiB. |
 | hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
 | "No tower set" | set the tower URL with `--tower URL` or enter it in menu item 3. |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
@@ -278,6 +342,12 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
   laptop by default.
 * The capture part only runs **on Linux** (iw/airodump-ng/tshark). On
   macOS/Windows only the tower and client upload are available.
+* **Monitor mode is hardware**: no software can make a card capture if its
+  driver/firmware does not expose monitor mode. The tool covers the common
+  setup paths, but it cannot create the capability.
+* On 2.4 GHz and 6 GHz some channel numbers are identical (e.g. channel 1).
+  Scanning both bands at once can therefore mislabel a 6 GHz AP as 2.4 GHz.
+  Scan 6 GHz on its own with `--band 6` when that matters.
 * M1+M2 detection checks **packet structure, not the MIC** — a "matching"
   exchange may still not be a valid handshake.
 * Brute force frequently fails in practice; "not found" is normal.
@@ -289,7 +359,29 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 
 ---
 
-## 12. Quick reference
+## 12. Related projects (research)
+
+This tool deliberately stays **passive** (no deauth, no injection). The
+following established open-source projects solve adjacent problems and were
+reviewed while building the compatibility layer:
+
+| Project | What it is good for | Note |
+|---|---|---|
+| [ZerBea/hcxdumptool](https://github.com/ZerBea/hcxdumptool) | Modern capture of EAPOL handshakes **and PMKID**, best chipset coverage | Transmits association/deauth frames; not passive. Use `--disable_deauthentication` and only on your own network |
+| [ZerBea/hcxtools](https://github.com/ZerBea/hcxtools) | `hcxpcapngtool` converts captures to `.hc22000` | Recommended by hashcat; the client uses it locally |
+| [derv82/wifite2](https://github.com/derv82/wifite2) | Automated audit workflow (scan → capture → crack) | Wraps aircrack-ng/hashcat; active by default |
+| [bettercap/bettercap](https://github.com/bettercap/bettercap) | Wi-Fi recon, PMKID, deauth in a scriptable framework | Active attacks |
+| [aircrack-ng/aircrack-ng](https://github.com/aircrack-ng/aircrack-ng) | `airodump-ng` scanning and `aircrack-ng` cracking | Used here for scanning |
+| [x4v1l0k/wifi-snatcher](https://github.com/x4v1l0k/wifi-snatcher) | Automated grab workflow: scan for APs **with clients**, capture, validate, wordlists | Active (broadcast deauth / PMKID). Only the passive parts (client detection, validation) are reflected here |
+| [vanhoefm/wifi-example-captures](https://github.com/vanhoefm/wifi-example-captures) | Real captures with documented passphrases | Used by `--download-captures` and the optional self-test |
+| [morrownr/USB-WiFi](https://github.com/morrownr/USB-WiFi) | Adapter buying guide: which chipsets do monitor mode / injection on Linux | Great for choosing hardware |
+
+What this project adds on top: a **strictly passive** capture path, a
+self-contained `.hc22000` upload, and GPU cracking over Tailscale.
+
+---
+
+## 13. Quick reference
 
 ```
 Start (menu):
@@ -298,12 +390,21 @@ Start (menu):
   python wifi-handshake.py --serve --port 8443   # tower server
   python wifi-handshake.py --tower URL --send cap.pcapng   # client upload
   python wifi-handshake.py --self-test       # engine tests, no radio
+  python wifi-handshake.py --inspect cap.pcapng   # find a handshake offline
+  python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW
+  python wifi-handshake.py --download-captures    # example captures -> ./test-captures
 
 Capture flow (menu item 1):
   choose adapter -> confirm YES -> scan -> pick a network
   -> select EAPOL set (M1+M2 default) -> wait for a handshake
   -> saved as handshake-<date>-<BSSID>.pcapng
+  -> offer to send to the tower, then back to the menu
   -> q quit / r rescan
+
+Band/channel options (--run-capture):
+  --band abg           2.4 + 5 GHz (default)      --band 6     6 GHz only
+  --band abg6          all three bands            --channels 1,6,11
+  --channels 5180      a frequency in MHz         --scan-seconds 30
 
 Engine API output (for scripts):
   Engine functions in wifi-handshake.py stay importable

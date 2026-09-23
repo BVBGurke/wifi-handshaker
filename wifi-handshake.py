@@ -1,16 +1,37 @@
 #!/usr/bin/env python3
-"""Offline, passive Wi-Fi handshake capture. Run --help or --self-test first.
+"""Passive Wi-Fi handshake capture and optional GPU cracking over Tailscale.
 
-This module is the engine. Run `python tui.py` (or this file) for the TUI.
+Run this file directly (`python wifi-handshake.py`) for the interactive menu,
+or use `--help` / `--self-test` first. The module is importable as an engine.
+
 Passive capture only: no deauthentication, injection or radio interference.
-Note: load it only from tui.py, not with submodules under the same package name.
+Monitor mode is a driver/firmware capability; the Adapter class tries several
+setup paths so it works on as many chipsets as possible.
+
+PROJECT RULE: all user-facing text is ENGLISH. Do not localize the interface
+(no German, no other languages). See the rule block right below this docstring.
 """
+
+# ===========================================================================
+# PROJECT RULE - READ BEFORE EDITING (this also applies to AI assistants):
+#
+#   The ENTIRE user-facing interface MUST ALWAYS be in ENGLISH.
+#
+#   This covers every menu, prompt, question, message, warning, error, hint,
+#   progress line and log line that a human can see. Do NOT translate the UI
+#   into German or any other language, do NOT add localized variants, and do
+#   NOT "improve" it by localizing. Code comments and identifiers stay English
+#   too. Any new UI text must be written in English.
+# ===========================================================================
 
 import argparse
 import base64
 import collections
+import contextlib
 import csv
+import getpass
 import hashlib
+import hmac
 import http.client
 import http.server
 import io
@@ -48,9 +69,50 @@ def clean(value):
     return "".join(c if c.isprintable() else "?" for c in value)
 
 
-def run(*args, check=True):
+# ANSI styling for the interactive UI. Disabled automatically when stdout is
+# not a terminal or when NO_COLOR is set (https://no-color.org/).
+STYLES = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "magenta": "\033[35m", "cyan": "\033[36m",
+}
+
+
+def use_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def style(text, *names):
+    if not use_color():
+        return text
+    return "".join(STYLES[name] for name in names) + str(text) + STYLES["reset"]
+
+
+def heading(text):
+    print("\n" + style(text, "bold", "cyan"))
+
+
+def info(text):
+    print(style(text, "dim"))
+
+
+def warn(text):
+    sys.stdout.flush()  # keep ordering when stdout is piped (block-buffered)
+    print(style("Warning: ", "bold", "yellow") + style(text, "yellow"), file=sys.stderr)
+
+
+def fail(text):
+    sys.stdout.flush()
+    print(style("Error: ", "bold", "red") + text, file=sys.stderr)
+
+
+def ok(text):
+    print(style("✓ ", "bold", "green") + style(text, "green"))
+
+
+def run(*args, check=True, timeout=30):
     result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=30)
+                            stderr=subprocess.PIPE, timeout=timeout)
     if check and result.returncode:
         raise RuntimeError(f"{args[0]} failed: {clean(result.stderr.strip())}")
     return result
@@ -66,6 +128,65 @@ def stop(proc):
             proc.wait()
 
 
+class SudoSession:
+    """Keeps the sudo timestamp alive so the password is asked only once.
+
+    ``sudo`` caches an authentication for a few minutes (15 by default). A
+    long capture can easily exceed that, so a daemon thread refreshes the
+    timestamp in the background while the capture runs.
+    """
+
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._refresh, daemon=True)
+
+    def _refresh(self):
+        while not self.stop_event.wait(45):
+            subprocess.run(["sudo", "-n", "-v"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def close(self):
+        self.stop_event.set()
+
+
+def sudo_cached():
+    return subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, check=False).returncode == 0
+
+
+def ensure_sudo(attempts=3):
+    """Ask for the sudo password once and keep the timestamp alive.
+
+    Returns a :class:`SudoSession` when authentication happened, or ``None``
+    when already running as root. Raises on repeated failure.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return None
+    if not shutil.which("sudo"):
+        raise RuntimeError("sudo is required. Run the script as root or install sudo.")
+    if sudo_cached():
+        return SudoSession().start()
+    heading("Root privileges for monitor mode")
+    info("The sudo password is asked once and is not stored.")
+    for attempt in range(1, attempts + 1):
+        try:
+            password = getpass.getpass("sudo password: ")
+        except EOFError as exc:
+            raise RuntimeError("Cannot read input (no terminal).") from exc
+        result = subprocess.run(["sudo", "-S", "-v", "-p", ""],
+                                input=password + "\n", text=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+        if result.returncode == 0:
+            ok("Authentication successful.")
+            return SudoSession().start()
+        warn(f"Wrong password ({attempt}/{attempts}).")
+    raise RuntimeError("sudo authentication failed.")
+
+
 def choose(prompt, size):
     while True:
         value = input(prompt).strip()
@@ -77,6 +198,12 @@ def choose(prompt, size):
 
 
 def adapters():
+    """List (interface, phy) pairs, skipping P2P helper interfaces.
+
+    ``p2p-dev-*`` virtual interfaces share a radio but cannot capture; listing
+    them only confuses the adapter choice, so they are filtered out. Monitor
+    interfaces that already exist are kept and can be reused directly.
+    """
     result = []
     phy = None
     for line in run("iw", "dev").stdout.splitlines():
@@ -84,22 +211,46 @@ def adapters():
         if line.startswith("phy#"):
             phy = "phy" + line[4:]
         elif line.startswith("Interface "):
-            result.append((line.split(maxsplit=1)[1], phy))
+            name = line.split(maxsplit=1)[1]
+            if name.startswith("p2p-dev-"):
+                continue
+            result.append((name, phy))
     return result
 
 
 class Adapter:
+    """A wireless interface prepared for monitor-mode capture.
+
+    Compatibility: monitor mode is a driver/firmware capability, so different
+    cards need different setup. Three paths are tried, in order, to cover as
+    many chipsets as possible:
+
+      1. An interface that is already in monitor mode is reused unchanged.
+      2. The managed interface is switched to monitor directly (works on
+         mac80211 drivers such as rtw88, ath9k, mt76, ...).
+      3. A dedicated monitor virtual interface is created with
+         ``iw phy <phy> interface add <name> type monitor`` (needed on drivers
+         that cannot switch the primary interface, e.g. some brcmfmac builds).
+
+    Drivers that support neither path (many Broadcom/Intel parts) genuinely
+    cannot capture; that is hardware, not software.
+    """
+
     def __init__(self, name, phy):
         self.name, self.phy = name, phy
         self.changed = False
         self.nm_changed = False
         self.nm_managed = False
         self.connection = None
+        self.created_vif = None
+        self.monitor_name = name
         info = run("iw", "dev", name, "info").stdout
         match = re.search(r"^\s*type (\S+)", info, re.M)
         self.original_type = match.group(1) if match else "unknown"
-        if self.original_type != "managed":
-            raise RuntimeError("Choose a managed-mode adapter; existing monitor/AP interfaces are left alone.")
+        if self.original_type not in ("managed", "monitor", "unknown"):
+            raise RuntimeError(
+                f"{name} is in '{self.original_type}' mode. Choose a dedicated "
+                "managed or monitor adapter; AP/IBSS interfaces are left alone.")
         link = json.loads(run("ip", "-j", "link", "show", "dev", name).stdout)[0]
         self.was_up = "UP" in link.get("flags", [])
         if shutil.which("nmcli"):
@@ -110,24 +261,65 @@ class Adapter:
                 self.nm_managed = bool(lines and lines[0] == "yes")
                 if len(lines) > 1 and re.fullmatch(r"[0-9a-fA-F-]{36}", lines[1]):
                     self.connection = lines[1]
-        capabilities = run("iw", "phy", phy, "info").stdout
-        if not re.search(r"^\s*\* monitor\s*$", capabilities, re.M):
-            raise RuntimeError(f"{name} does not advertise monitor-mode support.")
+        self.capabilities = run("iw", "phy", phy, "info").stdout
+        if not re.search(r"^\s*\* monitor\s*$", self.capabilities, re.M):
+            # Some out-of-tree drivers capture fine without advertising it, so
+            # this is a warning rather than a hard stop. enable() still fails
+            # with a clear message if the radio really cannot do monitor mode.
+            warn(f"{name} does not advertise monitor-mode support. Trying "
+                 "anyway; if setup fails, use a monitor-capable adapter.")
+
+    @property
+    def iface(self):
+        """Interface actually used for capture (may be a created monitor vif)."""
+        return self.monitor_name
 
     def enable(self):
+        if self.original_type == "monitor":
+            self.monitor_name = self.name
+            run("ip", "link", "set", "dev", self.name, "up", check=False)
+            print(f"{self.name} is already in monitor mode; reusing it.")
+            return
         if self.nm_managed:
             self.nm_changed = True
             run("nmcli", "device", "set", self.name, "managed", "no")
         self.changed = True
-        run("ip", "link", "set", "dev", self.name, "down")
-        run("iw", "dev", self.name, "set", "type", "monitor")
-        run("ip", "link", "set", "dev", self.name, "up")
+        try:
+            run("ip", "link", "set", "dev", self.name, "down")
+            run("iw", "dev", self.name, "set", "type", "monitor")
+            run("ip", "link", "set", "dev", self.name, "up")
+            self.monitor_name = self.name
+            return
+        except (RuntimeError, OSError) as exc:
+            print(f"Switching {self.name} to monitor mode failed ({exc}). "
+                  "Trying a dedicated monitor interface instead ...")
+        self._add_monitor_vif()
+
+    def _add_monitor_vif(self):
+        vif = self.name + "mon"
+        if len(vif) > 15:  # IFNAMSIZ limit
+            vif = "mon" + vif[-12:]
+        run("iw", "dev", vif, "del", check=False)
+        try:
+            run("iw", "phy", self.phy, "interface", "add", vif, "type", "monitor")
+            run("ip", "link", "set", "dev", vif, "up")
+        except (RuntimeError, OSError) as exc:
+            raise RuntimeError(
+                f"Could not put {self.name} into monitor mode ({exc}). "
+                "Common causes: the driver does not support monitor mode, the "
+                "radio is blocked (check `rfkill list`), or another Wi-Fi "
+                "manager is holding it. Use a monitor-capable adapter.") from exc
+        self.created_vif = vif
+        self.monitor_name = vif
+        print(f"Created dedicated monitor interface {vif} on {self.phy}.")
 
     def restore(self):
-        if not self.changed and not self.nm_changed:
+        if not self.changed and not self.nm_changed and not self.created_vif:
             return
-        print("\nRestoring adapter settings...")
+        print("\nRestoring adapter settings ...")
         commands = []
+        if self.created_vif:
+            commands.append(("iw", "dev", self.created_vif, "del"))
         if self.changed:
             commands += [("ip", "link", "set", "dev", self.name, "down"),
                          ("iw", "dev", self.name, "set", "type", self.original_type)]
@@ -142,17 +334,35 @@ class Adapter:
             try:
                 run(*command)
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-                print(f"Restore warning: {exc}", file=sys.stderr)
-                print("Retry: " + " ".join(command), file=sys.stderr)
+                warn(f"Restore failed: {exc}")
+                print("  Retry manually: " + " ".join(command), file=sys.stderr)
 
 
-def parse_networks(text):
+def parse_networks(text, frequency_by_channel=None):
+    """Parse an airodump-ng CSV export into network dicts.
+
+    ``frequency_by_channel`` maps an airodump channel number to the list of
+    frequencies we hopped. It is used to resolve the exact frequency for the
+    capture step, which matters on 5/6 GHz where the channel number alone is
+    ambiguous (e.g. channel 1 exists on 2.4 GHz and on 6 GHz).
+    """
+    frequency_by_channel = frequency_by_channel or {}
     networks = {}
+    clients = {}
+    station_section = False
     for row in csv.reader(io.StringIO(text)):
         if not row:
             continue
         if row[0].strip() == "Station MAC":
-            break
+            station_section = True
+            continue
+        if station_section:
+            # Station rows: Station MAC, ..., # packets, BSSID, Probed ESSIDs.
+            if len(row) >= 6:
+                station, ap = row[0].strip().lower(), row[5].strip().lower()
+                if MAC.fullmatch(station) and MAC.fullmatch(ap):
+                    clients.setdefault(ap, set()).add(station)
+            continue
         if len(row) < 14:
             continue
         bssid = row[0].strip().lower()
@@ -164,9 +374,14 @@ def parse_networks(text):
             continue
         if channel <= 0:
             continue
-        networks[bssid] = dict(bssid=bssid, channel=channel, power=power,
+        candidates = frequency_by_channel.get(channel) or []
+        frequency = min(candidates) if candidates else None
+        networks[bssid] = dict(bssid=bssid, channel=channel, frequency=frequency, power=power,
                                security=clean(" / ".join(v.strip() for v in row[5:8] if v.strip())),
                                ssid=clean(row[13].strip()) or "<hidden>")
+    # The station section follows the AP section, so attach clients afterwards.
+    for network in networks.values():
+        network["clients"] = sorted(clients.get(network["bssid"], ()))
     return sorted(networks.values(), key=lambda n: n["power"] if n["power"] < -1 else -999,
                   reverse=True)
 
@@ -183,52 +398,126 @@ def signal_label(dbm):
     return "weak"
 
 
-def scan_channels(capabilities, band, requested=None):
-    available = []
+def signal_bar(dbm):
+    """Four-block signal bar for the network list (weak -> strong)."""
+    levels = 0
+    if dbm < -1:
+        for threshold in (-80, -70, -60, -50):
+            if dbm >= threshold:
+                levels += 1
+    return "█" * levels + "░" * (4 - levels)
+
+
+# Frequency ranges per band selector. "b"/"g" are both 2.4 GHz, "a" is 5 GHz
+# and "6" is the 6 GHz band used by Wi-Fi 6E/7. Frequencies are the unit of
+# truth internally: airodump-ng can hop by frequency (-C) and `iw dev set freq`
+# takes MHz, which avoids the 2.4/6 GHz channel-number clash. (`iw dev set
+# channel` takes a channel *number*, not a frequency.)
+BAND_RANGES = {
+    "b": (2400, 2500),
+    "g": (2400, 2500),
+    "a": (5000, 5900),
+    "6": (5925, 7125),
+}
+
+
+def radio_channels(capabilities):
+    """Map enabled frequency (MHz) -> channel number from `iw phy ... info`."""
+    channels = {}
     for line in capabilities.splitlines():
         match = re.search(r"\*\s+(\d+(?:\.\d+)?) MHz \[(\d+)\]", line)
         if not match or "disabled" in line:
             continue
-        frequency, channel = float(match.group(1)), int(match.group(2))
-        if (2400 <= frequency < 2500 and "b" in band) or (5000 <= frequency < 5900 and "a" in band):
-            available.append(channel)
-    available = sorted(set(available))
+        channels[float(match.group(1))] = int(match.group(2))
+    return channels
+
+
+def frequency_bands(frequency):
+    """All band selectors that apply to a frequency (2.4 GHz is both b and g)."""
+    return {band for band, (low, high) in BAND_RANGES.items() if low <= frequency < high}
+
+
+def band_for_frequency(frequency):
+    bands = frequency_bands(frequency)
+    return sorted(bands)[0] if bands else None
+
+
+def scan_channels(capabilities, band, requested=None):
+    """Return the sorted frequencies to hop for the selected band(s).
+
+    ``band`` is a string of band selectors (e.g. "abg", "6", "abg6").
+    ``requested`` entries may be channel numbers or frequencies in MHz; a
+    channel number is resolved to every matching frequency in the band set.
+    """
+    available = radio_channels(capabilities)
+    wanted = set(band)
+    selected = {freq: channel for freq, channel in available.items()
+                if frequency_bands(freq) & wanted}
     if requested:
-        missing = set(requested) - set(available)
+        chosen, missing = {}, []
+        for value in requested:
+            if value > 1000:  # explicit frequency in MHz
+                matches = {value: selected[value]} if value in selected else {}
+            else:  # channel number, possibly present in several bands
+                matches = {freq: channel for freq, channel in selected.items()
+                           if channel == value}
+            if matches:
+                chosen.update(matches)
+            else:
+                missing.append(value)
         if missing:
             raise RuntimeError(f"Channels not enabled for the selected band/radio: {sorted(missing)}")
-        return sorted(set(requested))
-    if not available:
-        raise RuntimeError("No enabled 2.4/5 GHz channels found for this radio and band.")
-    return available
+        if not chosen:
+            raise RuntimeError("No usable channels for this radio and band.")
+        return sorted(chosen)
+    if not selected:
+        raise RuntimeError("No enabled 2.4/5/6 GHz channels found for this radio and band.")
+    return sorted(selected)
 
 
 def parse_channel_list(value):
     if not re.fullmatch(r"\d+(?:,\d+)*", value):
-        raise argparse.ArgumentTypeError("Use comma-separated channel numbers, e.g. 1,6,11 or 100")
+        raise argparse.ArgumentTypeError(
+            "Use comma-separated channels/frequencies, e.g. 1,6,11 or 5180 or 2412")
     channels = [int(item) for item in value.split(",")]
-    if any(c < 1 or c > 196 for c in channels):
-        raise argparse.ArgumentTypeError("Channel numbers must be between 1 and 196")
+    for channel in channels:
+        if channel > 1000:
+            if not 2400 <= channel <= 7125:
+                raise argparse.ArgumentTypeError("Frequencies must be between 2400 and 7125 MHz")
+        elif not 1 <= channel <= 233:
+            raise argparse.ArgumentTypeError("Channel numbers must be between 1 and 233")
     return channels
 
 
 def scan(adapter, directory, seconds, band, requested=None):
-    channels = scan_channels(run("iw", "phy", adapter.phy, "info").stdout, band, requested)
+    capabilities = run("iw", "phy", adapter.phy, "info").stdout
+    frequencies = scan_channels(capabilities, band, requested)
+    available = radio_channels(capabilities)
+    frequency_by_channel = {}
+    for frequency in frequencies:
+        frequency_by_channel.setdefault(available[frequency], []).append(frequency)
+    ambiguous = sorted(ch for ch, freqs in frequency_by_channel.items() if len(freqs) > 1)
+    if ambiguous:
+        print("Note: channel numbers " + ",".join(map(str, ambiguous))
+              + " exist on more than one band. Scan 6 GHz separately with --band 6 "
+                "so those access points are identified on the right frequency.")
     # Give every channel several beacon intervals, with time for two sweeps.
-    seconds = max(seconds, len(channels))
+    seconds = max(seconds, len(frequencies))
     # Discard old scan snapshots before rescanning.
     for old in directory.glob("scan-*.csv"):
         old.unlink()
     prefix = directory / "scan"
     log_path = directory / "scan.log"
     print(f"\nListening for nearby networks for {seconds} seconds...")
-    print("Requested scan channels: " + ",".join(map(str, channels)))
+    print("Requested scan frequencies: " + ",".join(str(int(f)) for f in frequencies) + " MHz")
     observed = set()
     with log_path.open("wb") as log:
-        proc = subprocess.Popen(["airodump-ng", "--channel", ",".join(map(str, channels)),
+        # -C hops by frequency in MHz, which works for 2.4/5/6 GHz alike and
+        # avoids the channel-number overlap between 2.4 GHz and 6 GHz.
+        proc = subprocess.Popen(["airodump-ng", "-C", ",".join(str(int(f)) for f in frequencies),
                                  "-f", "500", "--write", str(prefix),
                                  "--output-format", "csv", "--write-interval", "1",
-                                 adapter.name], stdout=log, stderr=log)
+                                 adapter.iface], stdout=log, stderr=log)
         try:
             deadline = time.monotonic() + seconds
             next_sample = time.monotonic()
@@ -236,26 +525,27 @@ def scan(adapter, directory, seconds, band, requested=None):
                 if proc.poll() is not None:
                     raise RuntimeError("Scan stopped: " + clean(log_path.read_text(errors="replace")[-2000:]))
                 if time.monotonic() >= next_sample:
-                    info = run("iw", "dev", adapter.name, "info").stdout
+                    info = run("iw", "dev", adapter.iface, "info").stdout
                     mode = re.search(r"^\s*type (\S+)", info, re.M)
-                    channel = re.search(r"^\s*channel (\d+)", info, re.M)
+                    frequency = re.search(r"\((\d+) MHz\)", info)
                     if not mode or mode.group(1) != "monitor":
                         raise RuntimeError("Adapter left monitor mode during scan. Another Wi-Fi manager may be interfering.")
-                    if channel:
-                        observed.add(int(channel.group(1)))
+                    if frequency:
+                        observed.add(int(frequency.group(1)))
                     next_sample = time.monotonic() + 0.7
                 time.sleep(0.2)
         finally:
             stop(proc)
-    print("Observed scan channels, sampled: " + (",".join(map(str, sorted(observed))) or "none"))
-    if len(channels) > 1 and len(observed) < 2:
+    print("Observed scan frequencies, sampled: "
+          + (",".join(str(f) for f in sorted(observed)) + " MHz" if observed else "none"))
+    if len(frequencies) > 1 and len(observed) < 2:
         print("WARNING: channel hopping was not observed. The driver or another Wi-Fi process may be holding the radio.")
     errors = log_path.read_text(errors="replace")
     for line in errors.splitlines():
         if re.search(r"(failed|error|busy|not supported|cannot|could not|couldn't|permission)", line, re.I):
             print("Scanner diagnostic: " + clean(line)[:500])
     files = sorted(directory.glob("scan-*.csv"))
-    return parse_networks(files[-1].read_text(errors="replace")) if files else []
+    return parse_networks(files[-1].read_text(errors="replace"), frequency_by_channel) if files else []
 
 
 class Handshake:
@@ -424,14 +714,17 @@ class CaptureStats:
                     self._tips_done.add(threshold)
 
 
-def check_radio(adapter, channel):
-    info = run("iw", "dev", adapter.name, "info").stdout
+def check_radio(adapter, frequency):
+    info = run("iw", "dev", adapter.iface, "info").stdout
     mode = re.search(r"^\s*type (\S+)", info, re.M)
-    actual = re.search(r"^\s*channel (\d+)", info, re.M)
     if not mode or mode.group(1) != "monitor":
         raise RuntimeError("Adapter left monitor mode. Another Wi-Fi manager may be controlling it.")
-    if not actual or int(actual.group(1)) != channel:
-        raise RuntimeError(f"Adapter is no longer on selected channel {channel}. "
+    if not frequency:
+        return
+    # Not every driver reports the current channel; only fail on a real mismatch.
+    actual = re.search(r"\((\d+) MHz\)", info)
+    if actual and int(actual.group(1)) != int(frequency):
+        raise RuntimeError(f"Adapter is no longer on selected frequency {int(frequency)} MHz. "
                            "Another process may be controlling the radio.")
 
 
@@ -461,30 +754,68 @@ def same_ap_networks(networks, chosen):
 
 def choose_handshake_mode():
     """Ask which EAPOL set to capture. M1+M2 is enough for hashcat -m 22000."""
-    print("\nEAPOL set selection:")
-    print("  1. M1+M2       (quick; enough for hashcat -m 22000) [default]")
-    print("  2. M1+M2+M3+M4 (full four-way; in practice rarely captured completely)")
-    choice = input("Choice [1]: ").strip()
+    heading("EAPOL set selection")
+    print("  " + style("1", "bold") + ". M1+M2       "
+          + style("(quick; enough for hashcat -m 22000) [default]", "dim"))
+    print("  " + style("2", "bold") + ". M1+M2+M3+M4 "
+          + style("(full four-way; in practice rarely captured completely)", "dim"))
+    choice = input(style("Choice [1]: ", "bold")).strip()
     return "m1m2m3m4" if choice == "2" else "m1m2"
 
 
+def tune_channel(adapter, network):
+    """Tune the monitor interface to the target network's frequency.
+
+    Frequencies (MHz) are used rather than channel numbers because channel
+    numbers overlap between 2.4 GHz and 6 GHz. ``iw dev set freq`` is the
+    command that takes MHz; ``iw dev set channel`` expects a channel number and
+    is only used as a fallback for older drivers, and only when that channel
+    number is unambiguous across the enabled bands. Returns the frequency used.
+    """
+    frequency = network.get("frequency")
+    channel = network["channel"]
+    if frequency and frequency > 1000:
+        try:
+            run("iw", "dev", adapter.iface, "set", "freq", str(int(frequency)))
+            return frequency
+        except (RuntimeError, OSError) as exc:
+            warn(f"Could not tune {int(frequency)} MHz directly ({exc}).")
+    # Fallback for drivers without `set freq`: only safe when this channel
+    # number maps to exactly one enabled frequency.
+    matching = sorted(freq for freq, number
+                      in radio_channels(adapter.capabilities).items() if number == channel)
+    if len(matching) == 1:
+        run("iw", "dev", adapter.iface, "set", "channel", str(channel))
+        return matching[0]
+    if len(matching) > 1:
+        raise RuntimeError(
+            f"Channel {channel} exists in several bands ({matching}) and this driver "
+            "did not accept an explicit frequency. Use a driver that supports "
+            "`iw dev set freq`.")
+    run("iw", "dev", adapter.iface, "set", "channel", str(channel))
+    return frequency
+
+
 def capture(adapter, network, directory, timeout, max_mb, messages=(1, 2), siblings=()):
-    run("iw", "dev", adapter.name, "set", "channel", str(network["channel"]))
-    check_radio(adapter, network["channel"])
+    frequency = tune_channel(adapter, network)
+    check_radio(adapter, frequency)
     raw = directory / "traffic.pcapng"
     log_path = directory / "capture.log"
     bssid = network["bssid"]
-    command = capture_command(adapter.name, raw, timeout, max_mb)
+    command = capture_command(adapter.iface, raw, timeout, max_mb)
     tracker = Handshake(bssid, messages)
     stats = CaptureStats(bssid, messages, siblings=siblings)
     wanted = "+".join(f"M{i}" for i in messages)
-    print(f"\nListening on channel {network['channel']} for {network['ssid']} [{bssid}].")
-    print(f"Waiting for a matching EAPOL exchange ({wanted}). Ctrl+C cancels.")
+    heading("Capturing handshake")
+    print("Target:  " + style(network["ssid"], "bold") + f"  [{bssid}]")
+    mhz = f" ({int(frequency)} MHz)" if frequency else ""
+    print(f"Channel: {network['channel']}{mhz}")
+    print(f"Waiting for EAPOL exchange: {style(wanted, 'bold')}   (Ctrl+C cancels)")
     if set(messages) == {1, 2}:
-        print("M1+M2 are enough for hashcat -m 22000; the full four-way handshake is not required.")
-    print("No packets are injected. A device must naturally connect or reconnect.")
-    print("Detection is for this exact BSSID, not every AP with the same network name.")
-    print(f"Temporary capture limit: {max_mb} MiB. Unrelated traffic is deleted on exit.")
+        info("M1+M2 are enough for hashcat -m 22000; the full four-way handshake is not required.")
+    info("No packets are injected. A device must naturally connect or reconnect.")
+    info("Detection is for this exact BSSID, not every AP with the same network name.")
+    info(f"Temporary capture limit: {max_mb} MiB. Unrelated traffic is deleted on exit.")
     started = last_status = time.monotonic()
     found = None
     buffer = b""
@@ -510,14 +841,14 @@ def capture(adapter, network, directory, timeout, max_mb, messages=(1, 2), sibli
                 now = time.monotonic()
                 if now - last_status >= 10:
                     stats.report(int(now - started))
-                    check_radio(adapter, network["channel"])
+                    check_radio(adapter, frequency)
                     last_status = now
             if not found:
                 stop(proc)
                 detail = clean(log_path.read_text(errors="replace")[-1500:])
                 if proc.returncode:
                     raise RuntimeError("Capture failed: " + detail)
-                print("Capture limit reached without a complete handshake. No capture saved.")
+                warn("Capture limit reached without a complete handshake. No capture saved.")
                 return None
         finally:
             stop(proc)
@@ -535,6 +866,215 @@ def save_capture(raw, frames, network, output):
     os.chmod(output, 0o600)
     if os.environ.get("SUDO_UID") and os.environ.get("SUDO_GID"):
         os.chown(output, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+
+
+# ---------------------------------------------------------------------------
+# Offline capture inspection (no radio, no root).
+#
+# Finds WPA/WPA2 four-way handshakes in an existing capture with the same field
+# parser the live capture uses, and, for WPA2-PSK, verifies the MIC with PBKDF2
+# and the 802.11 PRF. This is what turns the public example captures
+# (vanhoefm/wifi-example-captures) into a real regression test, and it lets you
+# check a capture before uploading it to the tower.
+# ---------------------------------------------------------------------------
+
+# LLC/SNAP header that precedes an EAPOL frame inside an 802.11 data frame.
+EAPOL_SNAP = bytes.fromhex("aaaa03000000888e")
+
+
+def parse_eapol_key(eapol):
+    """Parse an EAPOL-Key frame into message number, replay counter, nonce, MIC."""
+    if len(eapol) < 99 or eapol[1] != 3:
+        return None
+    key_info = int.from_bytes(eapol[5:7], "big")
+    ack, mic = key_info & 0x0080, key_info & 0x0100
+    install, secure = key_info & 0x0040, key_info & 0x0200
+    if ack and not mic:
+        message = 1
+    elif not ack and mic and not secure:
+        message = 2
+    elif ack and mic and install and secure:
+        message = 3
+    elif not ack and mic and secure:
+        message = 4
+    else:
+        return None
+    return dict(message=message, replay=int.from_bytes(eapol[9:17], "big"),
+                nonce=eapol[17:49], mic=eapol[81:97], key_info=key_info)
+
+
+def eapol_key_frames(path):
+    """Yield (frame, bssid, client, eapol_bytes, parsed) for EAPOL-Key frames.
+
+    The raw bytes come from tshark's ``jsonraw`` output. If that is unavailable
+    (older tshark) nothing is yielded and callers keep the structural result.
+    """
+    listing = run("tshark", "-n", "-r", str(path), "-Y", "eapol", "-T", "fields",
+                  "-e", "frame.number", "-e", "wlan.bssid", "-e", "wlan.sa",
+                  "-e", "wlan.da").stdout
+    rows = [line.split("\t") for line in listing.splitlines() if line.strip()]
+    result = run("tshark", "-n", "-r", str(path), "-Y", "eapol", "-T", "jsonraw",
+                 check=False)
+    if result.returncode:
+        return
+    try:
+        packets = json.loads(result.stdout or "[]")
+    except ValueError:
+        return
+    raws = []
+    for packet in packets:
+        try:
+            raws.append(bytes.fromhex(packet["_source"]["layers"]["frame_raw"][0]))
+        except (KeyError, IndexError, ValueError):
+            raws.append(b"")
+    for row, data in zip(rows, raws):
+        if len(row) < 4 or not data:
+            continue
+        frame, bssid, sa, da = row[0], row[1].lower(), row[2].lower(), row[3].lower()
+        if not (MAC.fullmatch(bssid) and MAC.fullmatch(sa) and MAC.fullmatch(da)):
+            continue
+        index = data.find(EAPOL_SNAP)
+        if index < 0:
+            continue
+        eapol = data[index + len(EAPOL_SNAP):]
+        parsed = parse_eapol_key(eapol)
+        if not parsed:
+            continue
+        client = da if parsed["message"] in (1, 3) else sa
+        yield frame, bssid, client, eapol, parsed
+
+
+def derive_ptk(pmk, aa, spa, anonce, snonce):
+    """802.11 PRF: derive the 48-byte CCMP PTK (KCK || KEK || TK)."""
+    def pair(first, second):
+        return min(first, second) + max(first, second)
+    data = pair(aa, spa) + pair(anonce, snonce)
+    output, counter = b"", 0
+    while len(output) < 48:
+        output += hmac.new(pmk, b"Pairwise key expansion\x00" + data
+                           + bytes([counter]), hashlib.sha1).digest()
+        counter += 1
+    return output[:48]
+
+
+def verify_mic(eapol, parsed, pmk, aa, spa, anonce, snonce):
+    """True/False whether an M2/M4 MIC matches the derived key (None if not M2/M4)."""
+    if parsed["message"] not in (2, 4) or parsed["mic"] == b"\x00" * 16:
+        return None
+    kck = derive_ptk(pmk, aa, spa, anonce, snonce)[:16]
+    body = bytearray(eapol)
+    body[81:97] = b"\x00" * 16
+    return hmac.new(kck, bytes(body), hashlib.sha1).digest()[:16] == parsed["mic"]
+
+
+def inspect_capture(path, ssid=None, password=None):
+    """Report (and optionally verify) the four-way handshakes in a capture.
+
+    Returns a summary dict: handshakes found, MICs verified and MICs mismatched.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"Capture file not found: {path}")
+    text = run("tshark", "-n", "-r", str(path), *field_options()).stdout
+    trackers, found = {}, []
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != len(FIELDS) or not MAC.fullmatch(fields[2].lower()):
+            continue
+        bssid = fields[2].lower()
+        tracker = trackers.setdefault(bssid, Handshake(bssid, (1, 2)))
+        match = tracker.feed(line)
+        if match:
+            found.append((bssid, match[0]["client"]))
+    heading("Capture: " + clean(path.name))
+    unique = sorted(set(found))
+    for bssid, client in unique:
+        ok(f"Handshake found: AP {bssid}, client {client}")
+    if not unique:
+        warn("No complete M1+M2 (or full four-way) handshake found.")
+    if bool(ssid) != bool(password):
+        warn("MIC verification needs both --essid and --password; skipping verification.")
+        ssid = password = None
+    summary = {"handshakes": len(unique), "verified": 0, "mismatched": 0}
+    if not (ssid and password):
+        if unique:
+            info("Pass --essid and --password to verify the MIC with a known passphrase.")
+        return summary
+    pmk = hashlib.pbkdf2_hmac("sha1", password.encode(), ssid.encode(), 4096, 32)
+    frames = list(eapol_key_frames(path))
+    if not frames:
+        warn("Raw EAPOL bytes unavailable (need tshark with -T jsonraw); cannot verify.")
+        return summary
+    groups = {}
+    for frame, bssid, client, eapol, parsed in frames:
+        groups.setdefault((bssid, client), []).append((frame, eapol, parsed))
+    for (bssid, client), entries in sorted(groups.items()):
+        anonce = next((p["nonce"] for _, _, p in entries if p["message"] in (1, 3)), None)
+        snonce = next((p["nonce"] for _, _, p in entries if p["message"] == 2), None)
+        if not anonce or not snonce:
+            continue
+        aa = bytes.fromhex(bssid.replace(":", ""))
+        spa = bytes.fromhex(client.replace(":", ""))
+        for frame, eapol, parsed in entries:
+            verified = verify_mic(eapol, parsed, pmk, aa, spa, anonce, snonce)
+            if verified is None:
+                continue
+            label = f"M{parsed['message']} MIC"
+            if verified:
+                summary["verified"] += 1
+                ok(f"  {label} verified for AP {bssid}, client {client}.")
+            else:
+                summary["mismatched"] += 1
+                fail(f"  {label} MISMATCH for AP {bssid}, client {client}.")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Example captures: download public test data (vanhoefm/wifi-example-captures).
+# ---------------------------------------------------------------------------
+
+EXAMPLE_CAPTURES_REPO = "vanhoefm/wifi-example-captures"
+# file name -> (SSID, passphrase) for captures whose secret is documented.
+KNOWN_EXAMPLE_PASSWORDS = {
+    "wnm_sleep_test-wpa2-psk:12345678.pcapng": ("test-wnm-rsn", "12345678"),
+}
+
+
+def download_example_captures(directory, repo=EXAMPLE_CAPTURES_REPO):
+    """Download .pcap/.pcapng files from a GitHub repository into a directory."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/contents/",
+        headers={"User-Agent": "wifi-handshake"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            items = json.load(response)
+    except (urllib.error.URLError, ValueError, OSError) as exc:
+        raise RuntimeError(f"Could not list {repo}: {exc}") from exc
+    if not isinstance(items, list):
+        raise RuntimeError(f"Unexpected response from {repo}: expected a directory listing.")
+    saved = []
+    for item in items:
+        name = item.get("name", "")
+        url = item.get("download_url")
+        if not url or not name.lower().endswith((".pcap", ".pcapng", ".cap")):
+            continue
+        target = directory / name
+        print("Downloading " + clean(name) + " ...")
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                target.write_bytes(response.read())
+        except (urllib.error.URLError, OSError) as exc:
+            warn(f"Failed to download {name}: {exc}")
+            continue
+        saved.append(target)
+    heading("Example captures in " + clean(str(directory)))
+    for target in saved:
+        print("  " + clean(target.name))
+    if not saved:
+        warn("No capture files found in the repository.")
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +1231,10 @@ class TowerConfig:
         self.cert_path = Path(cert_path).resolve() if cert_path else None
         self.key_path = Path(key_path).resolve() if key_path else None
         self.tls = tls
-        self.max_upload_mb = max_upload_mb
-        self.job_timeout = job_timeout
+        # serve() passes argparse defaults (None when the flag is absent).
+        # Never let a None leak in, or every upload would crash do_POST.
+        self.max_upload_mb = max_upload_mb or 64
+        self.job_timeout = job_timeout or 0
 
     @property
     def potfile(self):
@@ -890,6 +1432,10 @@ def build_hashcat_command(hashcat, hash_file, attack, out_file, potfile, config,
     if chosen not in BACKEND_IGNORE_FLAGS:
         chosen = backend if backend in BACKEND_IGNORE_FLAGS else None
     command += backend_flags(chosen, available_backends)
+    # Enforce the server's job runtime limit. hashcat --runtime stops the
+    # session gracefully after N seconds instead of us having to kill it.
+    if getattr(config, "job_timeout", 0):
+        command += ["--runtime", str(int(config.job_timeout))]
     command += sanitize_extra_args(attack.get("extra_args"))
     return command
 
@@ -1408,7 +1954,9 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
             attack = json.loads(base64.b64decode(self.headers.get("X-Attack", "")).decode())
         except (ValueError, UnicodeDecodeError):
             return self.send_json(400, {"error": "missing or invalid X-Attack header"})
-        filename = Path(self.headers.get("X-Filename", "capture.bin")).name or "capture.bin"
+        filename = Path(self.headers.get("X-Filename", "capture.bin")).name
+        if filename in ("", ".", ".."):
+            filename = "capture.bin"
         body = self.rfile.read(length)
         if not is_capture_like(body):
             return self.send_json(400, {"error": "body does not look like a capture"})
@@ -1802,7 +2350,6 @@ def self_test():
     assert tracker.feed("\t".join(["1", "1.0", ap, ap, client, "", "", "", "", ""])) is None
     assert tracker.feed(good[0].replace(ap, "02:00:00:00:00:01")) is None
     # Check that ordinary traffic and another AP's handshake are distinguished.
-    import contextlib
     stats = CaptureStats(ap)
     tracker = Handshake(ap)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -1818,14 +2365,34 @@ def self_test():
     sample = f"{ap}, first, last, 6, 54, WPA2, CCMP, PSK, -48, 2, 0, 0, 4, Test,\n"
     network = parse_networks(sample)[0]
     assert network["channel"] == 6 and network["security"] == "WPA2 / CCMP / PSK"
+    assert network["frequency"] is None
+    # A channel number can be resolved to its frequency for the capture step.
+    resolved = parse_networks(sample, {6: [2437.0]})[0]
+    assert resolved["frequency"] == 2437.0
+    assert resolved["clients"] == []
+    # Associated clients are parsed from the station section of the airodump CSV.
+    with_clients = parse_networks(sample
+        + "Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ESSIDs\n"
+        + f"02:aa:bb:cc:dd:ee, 0, 0, -40, 10, {ap}, Test\n")[0]
+    assert with_clients["clients"] == ["02:aa:bb:cc:dd:ee"]
     assert clean("bad\x1b\nssid") == "bad??ssid"
     assert signal_label(-1) == "unknown"
     capabilities = "\n".join(["* 2412.0 MHz [1] (20 dBm)", "* 2462 MHz [11] (20 dBm)",
                                "* 5500.0 MHz [100] (no IR, radar detection)",
                                "* 5845.0 MHz [169] (disabled)", "* 5955 MHz [1] (20 dBm)"])
-    assert scan_channels(capabilities, "abg") == [1, 11, 100]
-    assert scan_channels(capabilities, "bg") == [1, 11]
-    assert scan_channels(capabilities, "a", [100]) == [100]
+    assert radio_channels(capabilities) == {2412.0: 1, 2462.0: 11, 5500.0: 100, 5955.0: 1}
+    assert band_for_frequency(2437) == "b" and band_for_frequency(5180) == "a"
+    assert band_for_frequency(5955) == "6" and band_for_frequency(900) is None
+    assert frequency_bands(2437) == {"b", "g"} and frequency_bands(5955) == {"6"}
+    assert scan_channels(capabilities, "abg") == [2412.0, 2462.0, 5500.0]
+    assert scan_channels(capabilities, "bg") == [2412.0, 2462.0]
+    assert scan_channels(capabilities, "g") == [2412.0, 2462.0]
+    assert scan_channels(capabilities, "a") == [5500.0]
+    assert scan_channels(capabilities, "6") == [5955.0]
+    assert scan_channels(capabilities, "abg6") == [2412.0, 2462.0, 5500.0, 5955.0]
+    assert scan_channels(capabilities, "a", [100]) == [5500.0]
+    assert scan_channels(capabilities, "abg6", [5955]) == [5955.0]
+    assert scan_channels(capabilities, "abg", [2412]) == [2412.0]
     try:
         scan_channels(capabilities, "abg", [169])
     except RuntimeError:
@@ -1833,6 +2400,49 @@ def self_test():
     else:
         raise AssertionError("Disabled channel accepted")
     assert parse_channel_list("1,6,11") == [1, 6, 11]
+    assert parse_channel_list("2412,5180") == [2412, 5180]
+    try:
+        parse_channel_list("9999")
+    except argparse.ArgumentTypeError:
+        pass
+    else:
+        raise AssertionError("out-of-range frequency accepted")
+    # Channel tuning: `set freq <MHz>` is preferred, `set channel <n>` is only a
+    # fallback and must refuse ambiguous channel numbers (2.4 GHz vs 6 GHz).
+    class FakeAdapter:
+        iface = "wlan0"
+    FakeAdapter.capabilities = capabilities
+    calls = []
+    real_run = run
+    class FakeResult:
+        stdout = stderr = ""
+        returncode = 0
+    def recording_run(*args, **kwargs):
+        calls.append(args)
+        return FakeResult()
+    def failing_freq_run(*args, **kwargs):
+        calls.append(args)
+        if "freq" in args:
+            raise RuntimeError("simulated iw failure")
+        return FakeResult()
+    try:
+        globals()["run"] = recording_run
+        assert tune_channel(FakeAdapter(), {"channel": 11, "frequency": 2462.0}) == 2462.0
+        assert calls[-1] == ("iw", "dev", "wlan0", "set", "freq", "2462")
+        assert tune_channel(FakeAdapter(), {"channel": 11, "frequency": None}) == 2462.0
+        assert calls[-1] == ("iw", "dev", "wlan0", "set", "channel", "11")
+        globals()["run"] = failing_freq_run
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert tune_channel(FakeAdapter(), {"channel": 11, "frequency": 2462.0}) == 2462.0
+            assert calls[-1] == ("iw", "dev", "wlan0", "set", "channel", "11")
+            try:
+                tune_channel(FakeAdapter(), {"channel": 1, "frequency": 5955.0})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("ambiguous channel fallback accepted")
+    finally:
+        globals()["run"] = real_run
     # Tower: M1+M2 capture mode accepts the common short exchange.
     m12 = Handshake(ap, (1, 2))
     assert m12.feed(row(1, 1, 5, nonce_a)) is None
@@ -1907,6 +2517,20 @@ def self_test():
                                              {"type": "mask", "mask": "?d?d?d?d"},
                                              Path(tmp) / "out.txt", Path(tmp) / "pot", config)
         assert "-a" in mask_command and "3" in mask_command
+        assert "--runtime" not in mask_command  # no limit configured
+        config_limited = TowerConfig("127.0.0.1", 8443, Path(tmp) / "jobs", None,
+                                     [wl_dir], [rule_dir], job_timeout=600)
+        limited = build_hashcat_command("hashcat", Path(tmp) / "h.hc22000",
+                                        {"type": "mask", "mask": "?d?d?d?d"},
+                                        Path(tmp) / "out.txt", Path(tmp) / "pot", config_limited)
+        assert limited[limited.index("--runtime") + 1] == "600"
+        # serve() forwards argparse defaults; a None here used to crash every
+        # upload (do_POST: None * 1024 * 1024). Defaults must survive.
+        config_none = TowerConfig("127.0.0.1", 8443, Path(tmp) / "jobs", None,
+                                  [wl_dir], [rule_dir], max_upload_mb=None, job_timeout=None)
+        assert config_none.max_upload_mb == 64 and config_none.job_timeout == 0
+        parsed = build_parser().parse_args([])
+        assert parsed.max_upload_mb == 64 and parsed.job_timeout == 0
     if not shutil.which("tshark"):
         print("Self-test passed (pure logic, tower protocol, attack building). "
               "tshark not found; skipping the offline packet test.")
@@ -1955,14 +2579,28 @@ def self_test():
         assert exported.stat().st_size > 0
         decoded_again = run("tshark", "-n", "-r", str(exported), *field_options()).stdout
         assert test_rows(decoded_again.splitlines())
-    print("Self-test passed: parsing, signal labels, handshake matching (M1+M2 and M1-M4), "
-          "tower protocol, hashcat status parsing, attack building, tshark decoding and export.")
+    # Optional real-world regression: run against a downloaded example capture
+    # (see --download-captures). Skipped silently when the file is absent.
+    example_dir = Path(__file__).resolve().parent / "test-captures"
+    for name, (essid, password) in KNOWN_EXAMPLE_PASSWORDS.items():
+        example = example_dir / name
+        if not example.is_file():
+            continue
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = inspect_capture(example, essid, password)
+        assert result["handshakes"] >= 1, f"{name}: no handshake found"
+        assert result["mismatched"] == 0 and result["verified"] >= 1, \
+            f"{name}: MIC verification failed"
+        print(f"Self-test: verified example capture {name} (WPA2 MIC).")
+    print("Self-test passed: parsing, signal labels, channel tuning, client detection, "
+          "handshake matching (M1+M2 and M1-M4), offline MIC verification, tower protocol, "
+          "hashcat status parsing, attack building, tshark decoding and export.")
     print("No adapter changes, network access or radio capture performed.")
 
 
 
 # ---------------------------------------------------------------------------
-# Platform support and TUI entry point.
+# Platform support and interactive menu.
 #
 # Terminal modes: the default start runs an interactive menu (capture / tower /
 # client upload). Capture itself is Linux-only (iw/airodump-ng/tshark); macOS
@@ -1988,41 +2626,112 @@ def default_bind():
     return "0.0.0.0"
 
 
+def last_capture_marker():
+    """Path where a (possibly sudo-elevated) capture records its output file."""
+    uid = os.environ.get("SUDO_UID")
+    if uid:
+        try:
+            import pwd
+            return Path(pwd.getpwuid(int(uid)).pw_dir) / ".wifi-handshake" / "last_capture"
+        except (KeyError, ValueError, ImportError):
+            pass
+    return app_dir() / "last_capture"
+
+
+def menu_capture(args):
+    """Run the capture flow, elevating through sudo as a child process.
+
+    Using ``os.execvp`` (as the direct ``--run-capture`` path does) would
+    replace the whole process and drop the user back to the shell, so the menu
+    would never see the result. Running sudo as a child keeps the menu alive;
+    the child records the saved file in a marker the parent can read.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        session = ensure_sudo()
+        forwarded = [item for item in sys.argv[1:] if item != "--run-capture"]
+        marker = last_capture_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.unlink(missing_ok=True)
+        try:
+            code = subprocess.run(["sudo", "--", sys.executable, str(Path(__file__).resolve()),
+                                   "--run-capture", *forwarded]).returncode
+            captured = marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
+        finally:
+            if session is not None:
+                session.close()
+        marker.unlink(missing_ok=True)
+        return code, captured
+    return run_capture_cli(args), getattr(args, "last_capture", None)
+
+
 def run_interactive(args):
     while True:
-        print("\nwifi-handshake - Terminal Menu")
-        print("  1. Capture handshake  (Capture, Linux, sudo)")
-        print("  2. Start tower        (Server + hashcat, for the GPU box)")
-        print("  3. Send capture       (Client, to --tower URL)")
-        print("  4. Help / Install     (--help, download hashcat)")
-        print("  q  Quit")
-        choice = input("Choice: ").strip().lower()
+        heading("wifi-handshake - Terminal Menu")
+        print("  " + style("1", "bold") + ". Capture handshake  "
+              + style("(Linux, monitor mode, root)", "dim"))
+        print("  " + style("2", "bold") + ". Start tower        "
+              + style("(server + hashcat, for the GPU box)", "dim"))
+        print("  " + style("3", "bold") + ". Send capture       "
+              + style("(client, to --tower URL)", "dim"))
+        print("  " + style("4", "bold") + ". Help / Install     "
+              + style("(--help, download hashcat)", "dim"))
+        print("  " + style("5", "bold") + ". Inspect capture    "
+              + style("(offline: find/verify a handshake in a file)", "dim"))
+        print("  " + style("6", "bold") + ". Example captures   "
+              + style("(download public test data)", "dim"))
+        print("  " + style("q", "bold") + "  Quit")
+        choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
-            return run_capture_cli(args)
+            code, captured = menu_capture(args)
+            if code == 0 and captured:
+                if input("Send this capture to a tower now? [y/N] ").strip().lower() == "y":
+                    if not args.tower:
+                        args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
+                    if args.tower:
+                        args.send = Path(captured)
+                        run_headless(args)
+                    else:
+                        print("No tower URL set. Capture kept at " + captured)
+            continue
         if choice == "2":
-            if not args.tower and args.serve:
-                args.tower = f"https://{args.bind}:{args.port}"
-            return serve(args)
+            serve(args)
+            continue
         if choice == "3":
             if not args.tower:
                 args.tower = input("Tower URL (e.g. https://tower:8443): ").strip() or None
             if not args.tower:
-                print("No tower URL set. Aborting.")
+                warn("No tower URL set. Aborting.")
                 continue
             if not args.send:
                 cap = input("Path to capture file (.pcapng/.hc22000): ").strip()
                 args.send = Path(cap) if cap else None
             if not args.send or not Path(args.send).exists():
-                print("No valid capture file. Aborting.")
+                warn("No valid capture file. Aborting.")
                 continue
-            print("Sending capture to", args.tower)
-            return run_headless(args)
+            print("Sending capture to " + style(args.tower, "cyan"))
+            run_headless(args)
+            continue
         if choice == "4":
-            print("Installing hashcat...")
-            return install_tools(args.tools_dir)
+            print("Installing hashcat ...")
+            install_tools(args.tools_dir)
+            continue
+        if choice == "5":
+            cap = input("Capture file (.pcap/.pcapng): ").strip()
+            if not cap:
+                continue
+            essid = input("SSID (optional, enables MIC verification): ").strip() or None
+            password = None
+            if essid:
+                password = getpass.getpass("Passphrase (optional): ") or None
+            inspect_capture(Path(cap), essid, password)
+            continue
+        if choice == "6":
+            target = input("Target directory [test-captures]: ").strip() or "test-captures"
+            download_example_captures(Path(target), args.captures_repo)
+            continue
         if choice in ("q", ""):
             return 0
-        print("Invalid choice.")
+        warn("Invalid choice.")
 
 
 
@@ -2042,6 +2751,9 @@ def build_parser():
   python wifi-handshake.py --run-capture   # capture directly (Linux, sudo)
   python wifi-handshake.py --self-test     # offline tests
   python wifi-handshake.py --install-tools # download hashcat for the tower
+  python wifi-handshake.py --inspect cap.pcapng  # find a handshake offline
+  python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW  # verify MIC
+  python wifi-handshake.py --download-captures   # fetch example captures
 
 Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the tower
 and client roles work on every platform. Capture dependencies on Arch:
@@ -2067,19 +2779,33 @@ Only test networks you own or have permission to test.
     server.add_argument("--cert", type=Path, help="existing TLS certificate (PEM)")
     server.add_argument("--key", type=Path, help="existing TLS private key (PEM)")
     server.add_argument("--no-tls", action="store_true", help="serve plain HTTP")
-    server.add_argument("--max-upload-mb", type=int, help="upload size limit")
-    server.add_argument("--job-timeout", type=int, help="job runtime limit in seconds")
+    server.add_argument("--max-upload-mb", type=int, default=64, help="upload size limit in MiB, default 64")
+    server.add_argument("--job-timeout", type=int, default=0, help="job runtime limit in seconds (0 = unlimited)")
 
     capture = parser.add_argument_group("non-interactive capture (Linux, no TUI)")
-    capture.add_argument("--run-capture", action="store_true", help="capture without the TUI")
+    capture.add_argument("--run-capture", action="store_true", help="capture directly, without the menu")
     capture.add_argument("--handshake", choices=("m1m2", "m1m2m3m4"),
                          help="required EAPOL messages (default: m1m2; "
                               "m1m2 is enough for hashcat -m 22000)")
     capture.add_argument("--scan-seconds", type=int, default=20)
-    capture.add_argument("--band", choices=("bg", "a", "abg"), default="abg")
-    capture.add_argument("--channels", type=parse_channel_list, help="e.g. 1,6,11 or 100")
+    capture.add_argument("--band", choices=("bg", "a", "6", "abg", "ab6", "abg6"), default="abg",
+                         help="bands to scan: b/g=2.4 GHz, a=5 GHz, 6=6 GHz (default: abg)")
+    capture.add_argument("--channels", type=parse_channel_list,
+                         help="channels or frequencies, e.g. 1,6,11 or 5180 or 2412")
     capture.add_argument("--timeout", type=int, default=0, help="capture seconds; 0 waits indefinitely")
     capture.add_argument("--max-mb", type=int, default=256, help="temporary capture size limit")
+
+    offline = parser.add_argument_group("offline inspection (no radio, no root)")
+    offline.add_argument("--inspect", type=Path,
+                         help="analyse an existing .pcap/.pcapng and find handshakes")
+    offline.add_argument("--essid", help="SSID for --inspect MIC verification")
+    offline.add_argument("--password", help="passphrase for --inspect MIC verification")
+    offline.add_argument("--download-captures", nargs="?", const=Path("test-captures"),
+                         type=Path, help="download example captures into DIR "
+                                         "(default: ./test-captures)")
+    offline.add_argument("--captures-repo", default=EXAMPLE_CAPTURES_REPO,
+                         help="GitHub owner/repo to download captures from "
+                              f"(default: {EXAMPLE_CAPTURES_REPO})")
 
     headless = parser.add_argument_group("non-interactive client (no TUI)")
     headless.add_argument("--send", type=Path, help="send this capture instead of capturing")
@@ -2092,21 +2818,35 @@ Only test networks you own or have permission to test.
 def run_capture_cli(args):
     if not capture_supported():
         raise RuntimeError("Live capture needs Linux (iw/airodump-ng/tshark). "
-                           "On other systems use --host or --send/--watch.")
+                           "On other systems use --serve for the tower or --send/--watch.")
     if args.scan_seconds < 3 or args.timeout < 0 or args.max_mb < 1:
         raise RuntimeError("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
     if not sys.stdin.isatty():
         raise RuntimeError("Run in an interactive terminal for sudo and the menus.")
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        if not shutil.which("sudo"):
-            raise RuntimeError("sudo is required. Alternatively run this script as root.")
-        os.execvp("sudo", ["sudo", "--", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
-    os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+        # Ask for the sudo password once, then re-exec as root. The cached
+        # authentication means sudo does not prompt a second time, so the
+        # capture flow starts seamlessly.
+        ensure_sudo()
+        forwarded = list(sys.argv[1:])
+        if "--run-capture" not in forwarded:
+            forwarded.append("--run-capture")
+        os.execvp("sudo", ["sudo", "--", sys.executable, str(Path(__file__).resolve()), *forwarded])
+    # Keep the user's PATH (hashcat/tshark may live in /usr/local/bin) while
+    # ensuring the sbin directories that hold iw/ip are reachable.
+    os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin:" + os.environ.get("PATH", "")
     os.environ["LC_ALL"] = "C"
     os.umask(0o077)
     missing = [c for c in ("iw", "ip", "airodump-ng", "tshark") if not shutil.which(c)]
     if missing:
         raise RuntimeError("Missing local tools: " + ", ".join(missing) + ". Nothing was installed.")
+    if shutil.which("rfkill"):
+        listing = run("rfkill", "list", check=False).stdout
+        for block in re.split(r"\n\s*\n", listing):
+            if "Wireless LAN" in block and re.search(r"blocked:\s*yes", block, re.I):
+                warn("rfkill reports a blocked Wi-Fi radio. "
+                     "Run `sudo rfkill unblock wifi` if capture fails.")
+                break
     fields = run("tshark", "-G", "fields").stdout
     if any("\t" + field + "\t" not in fields for field in FIELDS):
         raise RuntimeError("This tshark build is missing required Wi-Fi/EAPOL fields.")
@@ -2116,22 +2856,28 @@ def run_capture_cli(args):
     available = adapters()
     if not available:
         raise RuntimeError("No wireless interfaces found.")
-    print("\nWireless adapters:")
+    heading("Wireless adapters")
     for i, (name, phy) in enumerate(available, 1):
-        print(f"  {i}. {name} [{phy}]")
+        print(f"  {style(i, 'bold')}. {name} " + style(f"[{phy}]", "dim"))
     name, phy = available[choose("Adapter number, or q: ", len(available))]
     adapter = Adapter(name, phy)
     siblings = [other for other, p in available if p == phy and other != name]
-    if siblings:
+    if siblings and adapter.original_type != "monitor":
+        # Switching a managed interface to monitor takes over the whole radio,
+        # so a sibling would lose its connection. An already-monitor interface
+        # is only brought up, which is harmless to siblings.
         raise RuntimeError("Other interfaces share this radio: " + ", ".join(siblings)
-                           + ". Use a dedicated radio to avoid disrupting them.")
-    print(f"\n{name} will disconnect from Wi-Fi while monitoring.")
-    print("Only use this on a network you own or have explicit permission to test.")
-    if input("Type YES to proceed: ").strip() != "YES":
+                           + ". Use a dedicated radio, or select an existing monitor interface.")
+    if siblings:
+        print("Note: " + ", ".join(siblings) + " share this radio; reusing the existing "
+              "monitor interface does not reconfigure them.")
+    print(f"\n{style(name, 'bold')} will disconnect from Wi-Fi while monitoring.")
+    warn("Only use this on a network you own or have explicit permission to test.")
+    if input(style("Type YES to proceed: ", "bold")).strip() != "YES":
         print("Cancelled. No adapter changes made.")
         return 0
     if not adapter.nm_managed:
-        print("NetworkManager does not manage this interface. Other Wi-Fi managers may interfere.")
+        info("NetworkManager does not manage this interface. Other Wi-Fi managers may interfere.")
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -2145,12 +2891,24 @@ def run_capture_cli(args):
                     if input("No networks found. Enter r to rescan, anything else to quit: ").strip().lower() == "r":
                         continue
                     return 1
-                print("\n  #  Signal             Ch  Advertised security          BSSID              Network")
+                heading(f"Networks found: {len(networks)}")
+                print(style(f"{'#':>3}  {'Signal':<24} {'Ch':>3}  {'Cl':>2}  {'Security':<28} "
+                            f"{'BSSID':<17} Network", "bold"))
                 for i, net in enumerate(networks, 1):
-                    strength = f"{net['power']} dBm {signal_label(net['power'])}" if net["power"] < -1 else "unknown"
-                    print(f"{i:3}  {strength:18} {net['channel']:3}  {net['security']:28} "
-                          f"{net['bssid']}  {net['ssid']}")
-                print("\nSignal is received power, not a speed test. Security labels may be incomplete.")
+                    if net["power"] < -1:
+                        strength = (f"{signal_bar(net['power'])} {net['power']} dBm "
+                                    f"{signal_label(net['power'])}")
+                    else:
+                        strength = "unknown"
+                    print(f"{i:3}  {strength:<24} {net['channel']:>3}  {len(net['clients']):>2}  "
+                          f"{net['security']:<28} {net['bssid']}  {net['ssid']}")
+                info("Signal is received power, not a speed test. Security labels may be incomplete.")
+                info("Cl = clients seen on that AP. Networks with clients are the best passive "
+                     "targets: they rekey when they reconnect on their own.")
+                with_clients = [n for n in networks if n["clients"]]
+                if with_clients:
+                    print("With clients: " + ", ".join(
+                        f"{n['ssid']} ({len(n['clients'])})" for n in with_clients[:8]))
                 groups = {}
                 for net in networks:
                     groups.setdefault(ap_base(net["bssid"]), []).append(net)
@@ -2165,11 +2923,12 @@ def run_capture_cli(args):
                 if answer == "q":
                     return 0
                 if not answer.isdecimal() or not 1 <= int(answer) <= len(networks):
-                    print("Invalid selection.")
+                    warn("Invalid selection.")
                     continue
                 network = networks[int(answer) - 1]
                 if not any(wpa in network["security"].upper() for wpa in ("WPA", "RSN")):
-                    print("This network does not advertise WPA/RSN. It has no WPA four-way handshake to capture.")
+                    warn("This network does not advertise WPA/RSN. "
+                         "It has no WPA four-way handshake to capture.")
                     continue
                 mode = getattr(args, "handshake", None)
                 if mode is None:
@@ -2191,9 +2950,20 @@ def run_capture_cli(args):
             except BaseException:
                 output.unlink(missing_ok=True)
                 raise
-            print(f"\nComplete four-message exchange captured for client {frames[0]['client']}.")
-            print(f"Saved: {output}")
-            print("Contains the exchange and target AP beacons. No password/MIC verification or cracking.")
+            wanted = "+".join(f"M{i}" for i in messages)
+            ok(f"Captured a matching EAPOL exchange ({wanted}) for client {frames[0]['client']}.")
+            print("Saved: " + style(output, "bold", "cyan"))
+            info("Contains the exchange and target AP beacons. "
+                 "No password/MIC verification or cracking.")
+            args.last_capture = str(output)
+            marker = last_capture_marker()
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(output), encoding="utf-8")
+                if os.environ.get("SUDO_UID") and os.environ.get("SUDO_GID"):
+                    os.chown(marker, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+            except OSError as exc:
+                print(f"Could not record the capture marker: {exc}", file=sys.stderr)
             return 0
     finally:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2229,6 +2999,12 @@ def main(argv=None):
             return 0
         if args.install_tools:
             return install_tools(args.tools_dir)
+        if args.download_captures is not None:
+            download_example_captures(args.download_captures, args.captures_repo)
+            return 0
+        if args.inspect:
+            summary = inspect_capture(args.inspect, args.essid, args.password)
+            return 1 if summary["mismatched"] else 0
         headless = run_headless(args)
         if headless is not None:
             return headless
@@ -2242,7 +3018,7 @@ def main(argv=None):
         print("\nCancelled.")
         return 130
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        fail(str(exc))
         return 1
 
 
