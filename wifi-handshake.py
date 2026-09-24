@@ -860,22 +860,35 @@ def print_tailnet_towers(towers):
 
 
 def _use_device_anyway(device, port):
-    """Ask whether to use a device that did not answer the host probe.
+    """Resolve a device that did not answer the host probe.
 
-    A device can be online while the probe fails because the host is not
-    running yet, another service occupies the port, or the client simply could
-    not reach it. Rather than looping forever on "does not run a host", let the
-    user point at the URL anyway and let the real connection decide.
+    Returns ``(url, port)`` when the user wants to use the device, else
+    ``None``. When the port is already answered by another service, a different
+    port is offered first: a host cannot listen on an occupied port, so trying
+    the same port again is guaranteed to fail with a TLS/HTTP error.
     """
     host = device.get("ip") or device.get("dns_name")
     if not host:
         return None
     reason = device.get("probe_error") or "no host service answered"
+    if port_answered(reason):
+        warn(f"{device['hostname']}: port {port} already answers with {reason} — "
+             f"another service uses it, so the host cannot listen there.")
+        if input(f"Use a different port for {device['hostname']}? [y/N] "
+                 ).strip().lower() in ("y", "yes"):
+            try:
+                raw = input(f"Port for {device['hostname']} [{port}]: ").strip()
+            except EOFError:
+                return None
+            if raw.isdecimal() and 0 < int(raw) < 65536:
+                new_port = int(raw)
+                return f"https://{host}:{new_port}", new_port
+            warn("Keeping the current port.")
     warn(f"{device['hostname']} did not answer as a host on port {port} ({reason}).")
     if input(f"Try {device['hostname']} at https://{host}:{port} anyway? [y/N] "
              ).strip().lower() not in ("y", "yes"):
         return None
-    return f"https://{host}:{port}"
+    return f"https://{host}:{port}", port
 
 
 def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
@@ -945,7 +958,8 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
             if not device.get("tower"):
                 chosen = _use_device_anyway(device, port)
                 if chosen:
-                    args.tower = chosen
+                    args.tower, port = chosen
+                    args.port = port
                     ok("Host set to " + args.tower)
                     return args.tower
                 continue
@@ -4101,16 +4115,22 @@ def self_test():
         with contextlib.redirect_stderr(io.StringIO()):
             builtins.input = lambda *a, **k: "y"
             assert _use_device_anyway({"hostname": "t", "ip": "1.2.3.4"},
-                                      8443) == "https://1.2.3.4:8443"
+                                      8443) == ("https://1.2.3.4:8443", 8443)
             builtins.input = lambda *a, **k: "n"
             assert _use_device_anyway({"hostname": "t", "ip": "1.2.3.4",
                                        "probe_error": "HTTP 401"}, 8443) is None
+            # A port that another service already occupies offers a port change
+            # first, so the user is not sent into a guaranteed TLS failure.
+            _port_answers = iter(["y", "9443"])
+            builtins.input = lambda *a, **k: next(_port_answers)
+            assert _use_device_anyway({"hostname": "t", "ip": "1.2.3.4",
+                                       "probe_error": "HTTP 401"}, 8443) == ("https://1.2.3.4:9443", 9443)
         # The picker must not loop when a device is not a host: answering the
         # number and then "y" sets the host and returns to the caller.
         _real_status = globals()["tailscale_status"]
         _real_ready = globals()["tailscale_ready"]
         _real_scan = globals()["scan_tailnet_devices"]
-        _answers = iter(["1", "y"])
+        _answers = iter(["1", "n", "y"])
         try:
             globals()["tailscale_status"] = lambda *a, **k: {"state": "Running"}
             globals()["tailscale_ready"] = lambda *a, **k: True
