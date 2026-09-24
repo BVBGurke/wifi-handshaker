@@ -466,6 +466,72 @@ def tailscale_login():
     return 0 if tailscale_ready() else 1
 
 
+def tailscale_serve_url(status=None):
+    """This host's MagicDNS URL (``https://<name>:443``) for a serve, or None."""
+    status = status or tailscale_status()
+    name = (status or {}).get("self_dns_name")
+    return f"https://{name}:443" if name else None
+
+
+def tailscale_serve(port, timeout=60):
+    """Expose a local HTTPS host on the tailnet via ``tailscale serve``.
+
+    Runs ``tailscale serve --bg https+insecure://localhost:<port>`` so the host
+    is reachable at ``https://<magicdns>:443`` even when the OS firewall drops
+    every other inbound port (the common Windows case). The tailnet's HTTPS
+    certificates must be enabled (admin console -> DNS -> HTTPS Certificates).
+    Returns the client URL, or None on failure.
+    """
+    if not tailscale_available():
+        warn("Tailscale is not installed. See https://tailscale.com/download")
+        return None
+    command = tailscale_command("serve", "--bg", f"https+insecure://localhost:{port}")
+    if command is None:
+        warn("Tailscale is not installed. See https://tailscale.com/download")
+        return None
+    print("Exposing local host via Tailscale: " + " ".join(command))
+    try:
+        result = subprocess.run(command, text=True, timeout=timeout,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"Could not run tailscale serve: {clean(str(exc))}")
+        return None
+    if result.returncode:
+        warn(f"tailscale serve failed (exit {result.returncode}).")
+        for line in (result.stderr or "").strip().splitlines()[:3]:
+            print("  " + clean(line))
+        info("If HTTPS is disabled for the tailnet, enable it in the admin console "
+             "(DNS -> HTTPS Certificates).")
+        return None
+    url = tailscale_serve_url()
+    if not url:
+        return None
+    ok(f"Host exposed on the tailnet: {url}")
+    print("  Client: python wifi-handshake.py --tower " + url)
+    return url
+
+
+def tailscale_serve_reset():
+    """Remove all ``tailscale serve`` configuration on this machine."""
+    command = tailscale_command("serve", "reset")
+    if command is None:
+        warn("Tailscale is not installed. See https://tailscale.com/download")
+        return False
+    try:
+        result = subprocess.run(command, text=True, timeout=30,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"Could not run tailscale serve reset: {clean(str(exc))}")
+        return False
+    if result.returncode:
+        warn(f"tailscale serve reset failed (exit {result.returncode}).")
+        return False
+    ok("Tailscale serve configuration cleared.")
+    return True
+
+
 def choose_tailscale_tower(args):
     """Offer tailnet peers as the tower and remember the chosen URL."""
     status = print_tailscale_status()
@@ -661,16 +727,26 @@ def is_tailnet_address(host):
     return address in TAILNET_V4 or address in TAILNET_V6
 
 
+def is_tailnet_name(host):
+    """True for a Tailscale MagicDNS name (always under ``.ts.net``).
+
+    Used to route MagicDNS names through the SOCKS5 proxy first: in userspace
+    mode the client has no tailnet route and cannot resolve them itself, but the
+    proxy can (``socks5h`` semantics).
+    """
+    return host.rstrip(".").lower().endswith(".ts.net")
+
+
 def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
     """Return ``(connected_socket, connect_ms)``, trying direct then SOCKS5.
 
-    A tailnet IP that is only reachable in userspace (root-less) mode has no
-    direct route, so for tailnet addresses the SOCKS5 proxy is tried *first*;
+    A tailnet IP or MagicDNS name that is only reachable in userspace (root-less)
+    mode has no direct route, so for those the SOCKS5 proxy is tried *first*;
     otherwise a direct connection is preferred and SOCKS5 is the fallback. All
     failure reasons are kept so the error explains which path was attempted.
     """
     proxy = tailscale_proxy()
-    if proxy and is_tailnet_address(host):
+    if proxy and (is_tailnet_address(host) or is_tailnet_name(host)):
         attempts = [("SOCKS5", proxy), ("direct", None)]
     else:
         attempts = [("direct", None)] + ([("SOCKS5", proxy)] if proxy else [])
@@ -3380,6 +3456,10 @@ def serve(args):
               "clients may see this host as unreachable. Allow the ports (admin "
               "PowerShell):")
         print("  " + windows_firewall_hint(ports))
+    if getattr(args, "tailscale_serve", False):
+        # Firewall-free alternative: tailscaled proxies the local host on the
+        # tailnet at https://<magicdns>:443, so no inbound port needs opening.
+        tailscale_serve(config.port)
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()
@@ -4121,6 +4201,9 @@ def self_test():
     # Tower: tailnet addresses prefer the SOCKS5 path in userspace mode.
     assert is_tailnet_address("100.105.183.20") and is_tailnet_address("fd7a:115c:a1e0::1")
     assert not is_tailnet_address("10.0.0.1") and not is_tailnet_address("tower")
+    assert is_tailnet_name("jannistower.tailfcf2d7.ts.net")
+    assert is_tailnet_name("wifi-handshaker-laptop.tailfcf2d7.ts.net.")
+    assert not is_tailnet_name("tower") and not is_tailnet_name("100.105.183.20")
     # Multi-port fallback: port parsing and precedence.
     assert normalize_ports(None) == [DEFAULT_PORT]
     assert normalize_ports(8443) == [8443]
@@ -4713,8 +4796,21 @@ def menu_firewall(args):
               f"&& sudo firewall-cmd --reload")
 
 
+def menu_tailscale_serve(args):
+    """Expose the local host on the tailnet via `tailscale serve` (firewall-free)."""
+    ports = configured_ports(args)
+    heading("Expose host via Tailscale serve")
+    info("Run this on the machine that runs --serve (the GPU box).")
+    info("tailscaled proxies the local HTTPS host to https://<magicdns>:443, so "
+         "the OS firewall never has to allow an inbound port.")
+    answer = input(f"Local host port to expose [{ports[0]}]: ").strip()
+    port = int(answer) if answer.isdecimal() and 0 < int(answer) < 65536 else ports[0]
+    if tailscale_serve(port):
+        print("Stop sharing with: python wifi-handshake.py --tailscale-serve-reset")
+
+
 def menu_setup(args):
-    """Setup submenu: Tailscale, devices, connection test, firewall, ports, tools."""
+    """Setup submenu: Tailscale, devices, connection test, firewall, serve, ports."""
     while True:
         ports = configured_ports(args)
         label = ",".join(map(str, ports))
@@ -4727,9 +4823,11 @@ def menu_setup(args):
               + style("(pre-flight: probe the host across the ports)", "dim"))
         print("  " + style("4", "bold") + ". Firewall            "
               + style("(open the host ports for tailnet clients)", "dim"))
-        print("  " + style("5", "bold") + ". Host ports          "
+        print("  " + style("5", "bold") + ". Expose via Tailscale "
+              + style("(serve the host firewall-free at :443)", "dim"))
+        print("  " + style("6", "bold") + ". Host ports          "
               + style(f"(current: {label})", "dim"))
-        print("  " + style("6", "bold") + ". Help / Install      "
+        print("  " + style("7", "bold") + ". Help / Install      "
               + style("(--help, download hashcat)", "dim"))
         print("  " + style("b", "bold") + "  Back")
         choice = input(style("Setup choice: ", "bold")).strip().lower()
@@ -4750,8 +4848,10 @@ def menu_setup(args):
         elif choice == "4":
             menu_firewall(args)
         elif choice == "5":
-            _ask_ports(ports, args)
+            menu_tailscale_serve(args)
         elif choice == "6":
+            _ask_ports(ports, args)
+        elif choice == "7":
             print("Installing hashcat ...")
             install_tools(args.tools_dir)
         elif choice in ("b", "", "q"):
@@ -4954,6 +5054,11 @@ Only test networks you own or have permission to test.
                            help="scan tailnet peers for running hosts, then exit")
     tailscale.add_argument("--list-devices", action="store_true",
                            help="list all reachable tailnet devices, then exit")
+    tailscale.add_argument("--tailscale-serve", action="store_true",
+                           help="expose the local host on the tailnet via `tailscale "
+                                "serve` (firewall-free: https://<magicdns>:443)")
+    tailscale.add_argument("--tailscale-serve-reset", action="store_true",
+                           help="remove all `tailscale serve` configuration, then exit")
     return parser
 
 
@@ -5172,6 +5277,12 @@ def main(argv=None):
         if args.tailscale_status:
             print_tailscale_status()
             return 0
+        if args.tailscale_serve_reset:
+            return 0 if tailscale_serve_reset() else 1
+        if args.tailscale_serve and not args.serve:
+            # Standalone: expose an already-running host (pass --port for its port).
+            url = tailscale_serve(configured_ports(args)[0])
+            return 0 if url else 1
         if args.discover_towers:
             if not tailscale_ready():
                 warn("Tailscale is not running. Start it with `sudo tailscale up`.")

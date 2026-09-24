@@ -148,8 +148,9 @@ Setup
   2. Devices            (list reachable tailnet devices, pick the host)
   3. Connection test    (pre-flight: probe the host across the ports)
   4. Firewall           (open the host ports for tailnet clients)
-  5. Host ports         (change the port list used by host and client)
-  6. Help / Install     (--help, download hashcat)
+  5. Expose via Tailscale (serve the host firewall-free at :443)
+  6. Host ports         (change the port list used by host and client)
+  7. Help / Install     (--help, download hashcat)
   b  Back
 ```
 
@@ -170,6 +171,15 @@ list with `New-NetFirewallRule` (an admin shell is required); without it
 Defender Firewall silently drops the ports, so a running host looks
 unreachable from the tailnet. On Linux it prints the matching `ufw`/
 `firewalld` commands instead.
+
+**Setup → 5 – Expose via Tailscale** is the firewall-free alternative: it runs
+`tailscale serve --bg https+insecure://localhost:<port>` on the host, so
+tailscaled proxies the local HTTPS host to `https://<magicdns>:443`. No inbound
+port has to be opened, which is exactly what a locked-down Windows host needs.
+It requires HTTPS certificates in the tailnet (admin console → **DNS → HTTPS
+Certificates**). The host prints the matching client command, e.g.
+`--tower https://jannistower.tailfcf2d7.ts.net:443`. Undo it with
+`--tailscale-serve-reset`.
 
 The menu stays open after each action. After a successful capture it asks what
 to do with the file (menu item 1 → capture → "Send to a host (s), compute
@@ -206,6 +216,7 @@ Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--ports N,N`, `--port N`, `--insecure`,
 `--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
 `--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
+`--tailscale-serve`, `--tailscale-serve-reset`,
 `--discover-towers`, `--list-devices`, `--local`, `--local-capture FILE`,
 `--resume JOB_ID`, `--restore JOB_ID`.
 
@@ -411,6 +422,17 @@ Override the list with `--ports 8443,9443,...` or a single `--port N`. If a
 foreign service answers on a port, the device list marks it `! HTTP 401` (or
 another status) instead of `(no host)`, and the client keeps scanning the rest.
 
+If Windows Firewall blocks the inbound ports and you cannot or do not want to
+open them, expose the host through Tailscale instead — no firewall rule needed:
+```
+python wifi-handshake.py --serve --tailscale-serve
+```
+This prints a client URL such as
+`https://jannistower.tailfcf2d7.ts.net:443`; connect the laptop with
+`--tower https://jannistower.tailfcf2d7.ts.net:443`. It requires HTTPS
+certificates in the tailnet (admin console → **DNS → HTTPS Certificates**).
+Undo with `--tailscale-serve-reset`.
+
 ### Step 2 – Capture a handshake (Laptop)
 Via menu item **1 – Capture handshake** (or `--run-capture`):
 
@@ -567,6 +589,7 @@ project folder, new captures are written to `captures/` (override with
 | hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
 | "No host set" | set the host URL with `--tower URL` or enter it in menu item 3. |
 | Device list shows `! HTTP 401` (or another status) instead of a host | another service already listens on that port. Run `--serve` (without `--port`): it picks the first free port from the list and the client scans the same list. Verify with **Setup → 3 – Connection test**. |
+| Host is online but **every** port times out (no answer, not refused) | Windows Defender Firewall is dropping the inbound ports. Add a rule for the list (**Setup → 4 – Firewall**) or skip the firewall entirely with `--serve --tailscale-serve` (reachable at `https://<magicdns>:443`). |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
 
 ---
