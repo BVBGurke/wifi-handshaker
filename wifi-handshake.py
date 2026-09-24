@@ -75,6 +75,48 @@ for _output_stream in (sys.stdout, sys.stderr):
 
 MAC = re.compile(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$")
 DEFAULT_PORT = 8443
+# Candidate host ports, tried in order. They stay below the OS ephemeral ranges
+# (Linux 32768-60999, Windows 49152-65535), so a running host can never lose its
+# port to an outgoing connection. Override with config.json "ports" or --ports.
+DEFAULT_PORTS = (8443, 9443, 10443, 11443, 12443)
+
+
+def normalize_ports(value):
+    """Return a clean list of ports from an int, a list/tuple, or None.
+
+    Accepts the many shapes the port setting arrives in (argparse default,
+    config JSON, a single ``--port``) so callers always get a list to iterate.
+    Invalid or empty input falls back to :data:`DEFAULT_PORT`.
+    """
+    if value is None:
+        return [DEFAULT_PORT]
+    if isinstance(value, int):
+        return [value] if 0 < value < 65536 else [DEFAULT_PORT]
+    ports = []
+    for item in value:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536:
+            ports.append(port)
+    return ports or [DEFAULT_PORT]
+
+
+def port_list(value):
+    """Parse ``"8443,9443"`` into ``[8443, 9443]`` (argparse ``type=``)."""
+    ports = []
+    for piece in str(value).replace(" ", "").split(","):
+        if not piece:
+            continue
+        if not piece.isdecimal() or not 0 < int(piece) < 65536:
+            raise argparse.ArgumentTypeError(f"invalid port {piece!r}")
+        ports.append(int(piece))
+    if not ports:
+        raise argparse.ArgumentTypeError("no ports given")
+    return ports
+
+
 FIELDS = ["frame.number", "frame.time_epoch", "wlan.bssid", "wlan.sa", "wlan.da",
           "wlan_rsna_eapol.keydes.msgnr", "eapol.keydes.replay_counter",
           "wlan_rsna_eapol.keydes.nonce", "wlan_rsna_eapol.keydes.key_info.key_type",
@@ -334,13 +376,13 @@ def tailscale_peer(name, status=None):
     return None
 
 
-def tailscale_tower_endpoint(name="tower", port=DEFAULT_PORT):
-    """Return ``(host, scheme)`` for a tailnet peer, or ``None``.
+def tailscale_tower_endpoint(name="tower", ports=DEFAULT_PORT):
+    """Return ``(host, scheme, port)`` for a tailnet peer, or ``None``.
 
-    The peer's tailnet IP is preferred; the scheme is detected with the health
-    handshake so a ``--no-tls`` host is reached over plain HTTP instead of
-    wrongly being forced to HTTPS. Falls back to ``https`` when the host does
-    not answer (the caller then produces the usual connection error).
+    The peer's tailnet IP is preferred. Every candidate port is probed with the
+    health handshake, so the working port (and HTTPS vs ``--no-tls`` HTTP) is
+    discovered instead of assumed. Falls back to the first port and ``https``
+    when the host does not answer (the caller then produces the usual error).
     """
     status = tailscale_status()
     if not tailscale_ready(status):
@@ -351,16 +393,19 @@ def tailscale_tower_endpoint(name="tower", port=DEFAULT_PORT):
     host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
-    found = probe_tower(host, port)
-    return host, (found[0] if found else "https")
+    ports = normalize_ports(ports)
+    found = probe_tower_ports(host, ports)
+    if found:
+        return host, found[0], found[2]
+    return host, "https", ports[0]
 
 
-def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
+def tailscale_tower_url(name="tower", ports=DEFAULT_PORT, scheme="https"):
     """Build a tower URL from a tailnet peer's IP address, or None."""
-    endpoint = tailscale_tower_endpoint(name, port)
+    endpoint = tailscale_tower_endpoint(name, ports)
     if not endpoint:
         return None
-    host, detected = endpoint
+    host, detected, port = endpoint
     return f"{detected or scheme}://{host}:{port}"
 
 
@@ -433,10 +478,14 @@ def choose_tailscale_tower(args):
     host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
-    port = getattr(args, "port", DEFAULT_PORT)
-    found = probe_tower(host, port)
-    scheme = found[0] if found else "https"
+    ports = configured_ports(args)
+    found = probe_tower_ports(host, ports)
+    if found:
+        scheme, _health, port = found
+    else:
+        scheme, port = "https", ports[0]
     args.tower = f"{scheme}://{host}:{port}"
+    args.port = port
     ok("Host URL set to " + args.tower)
     return args.tower
 
@@ -729,14 +778,44 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=Non
     return None
 
 
-def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
+def probe_tower_ports(host, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=None):
+    """Find the first port in ``ports`` where a tower answers.
+
+    Returns ``(scheme, health, port)`` or ``None``. This is the pre-flight check
+    the client runs before an upload: every candidate port is tested with the
+    same health handshake, and a port occupied by another service (HTTP/TLS
+    reply) is skipped silently so the next one is tried. When nothing is found,
+    ``detail`` keeps the most informative reason (a port that answered wins over
+    a silent timeout) plus the port it came from.
+    """
+    ports = normalize_ports(ports)
+    best = None
+    for port in ports:
+        per = {}
+        found = probe_tower(host, port, timeout, per)
+        if found:
+            return found[0], found[1], port
+        error = per.get("error")
+        if not error:
+            continue
+        # Prefer evidence that something answered on a port over "no answer":
+        # that is the "another service occupies the port" case worth surfacing.
+        if best is None or (port_answered(error) and not port_answered(best.get("error"))):
+            best = {"error": error, "status": per.get("status"), "port": port}
+    if detail is not None and best:
+        detail.update(best)
+    return None
+
+
+def scan_tailnet_devices(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
     """List every online tailnet device with latency and tower status.
 
     This device is included and marked with ``self=True``. Each peer is probed
     in parallel: one ICMP ping for the latency and the tower health handshake
-    (HTTPS first, then HTTP) to see whether it runs a tower. The result is
-    sorted online-first and then by hostname.
+    (HTTPS first, then HTTP) across every candidate port to see whether it runs
+    a tower. The result is sorted online-first and then by hostname.
     """
+    ports = normalize_ports(ports)
     status = status or tailscale_status()
     if not tailscale_ready(status):
         return []
@@ -757,15 +836,15 @@ def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIM
         if entry["latency"] is None and host:
             # ICMP is unavailable (userspace mode, firewalled peer): fall
             # back to the TCP connect time through the direct/SOCKS5 path.
-            entry["latency"] = connect_latency(host, port, timeout)
+            entry["latency"] = connect_latency(host, ports[0], timeout)
         detail = {}
-        found = probe_tower(host, port, timeout, detail) if host else None
+        found = probe_tower_ports(host, ports, timeout, detail) if host else None
         entry["tower"] = found is not None
-        entry["probe_port"] = port
         if found:
-            entry["scheme"], entry["health"] = found
-            entry["url"] = f"{found[0]}://{host}:{port}"
+            entry["scheme"], entry["health"], entry["probe_port"] = found
+            entry["url"] = f"{found[0]}://{host}:{found[2]}"
         else:
+            entry["probe_port"] = detail.get("port") or ports[0]
             entry["probe_error"] = detail.get("error")
         return entry
 
@@ -833,22 +912,27 @@ def print_tailnet_devices(devices):
 
 
 def windows_firewall_hint(port):
-    """PowerShell command that lets the host port through Windows Firewall.
+    """PowerShell command that lets the host port(s) through Windows Firewall.
 
-    Windows drops unsolicited inbound packets on ports without an allow rule,
-    so a host that is running can still look unreachable from the tailnet. The
-    symptom is a *silent* timeout (no RST), unlike a normal closed port.
+    Accepts one port or a list; ``-LocalPort`` takes a comma-separated list, so
+    one rule covers every candidate port. Windows drops unsolicited inbound
+    packets on ports without an allow rule, so a host that is running can still
+    look unreachable from the tailnet — a silent timeout, not a refused connect.
     """
-    return (f'New-NetFirewallRule -DisplayName "wifi-handshaker {port}" '
-            f'-Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} '
+    if isinstance(port, (list, tuple, set)):
+        ports = ",".join(str(int(p)) for p in port)
+    else:
+        ports = str(int(port))
+    return (f'New-NetFirewallRule -DisplayName "wifi-handshaker {ports}" '
+            f'-Direction Inbound -Action Allow -Protocol TCP -LocalPort {ports} '
             f'-Profile Any')
 
 
-def warn_host_unavailable(devices, port=DEFAULT_PORT):
+def warn_host_unavailable(devices, ports=DEFAULT_PORT):
     """Warn when the configured default host is online but not serving the host service.
 
     The device may simply not run ``--serve`` right now, or another service may
-    occupy the port — give the user a concrete hint instead of a bare list.
+    occupy a port — give the user a concrete hint instead of a bare list.
     """
     name = load_config().get("tower_name")
     if not name:
@@ -857,31 +941,33 @@ def warn_host_unavailable(devices, port=DEFAULT_PORT):
     hits = [d for d in devices if d["hostname"].lower() == want]
     if not hits or any(d.get("tower") for d in hits):
         return
+    ports = normalize_ports(ports)
+    hit = hits[0]
     reason = next((d.get("probe_error") for d in hits if d.get("probe_error")), None)
+    busy_port = hit.get("probe_port") or ports[0]
     if port_answered(reason):
         # Something already answers there, so `--serve` cannot simply take the
-        # port. Point at a free port instead of telling the user to start a host
-        # that would silently share (Windows) or crash (Linux).
-        warn(f"Configured host '{name}' is online, but port {port} already answers "
-             f"with '{reason}' — another service uses it. Start the host on a free "
-             f"port there, e.g. python wifi-handshake.py --serve --port 9443, and "
-             f"connect with the same --port here.")
+        # port. Point at the fallback list instead of telling the user to start a
+        # host that would silently share (Windows) or crash (Linux).
+        warn(f"Configured host '{name}' is online, but port {busy_port} already "
+             f"answers with '{reason}' — another service uses it. Start the host "
+             f"there with: python wifi-handshake.py --serve (it picks the first "
+             f"free port from {ports}); the client scans the same list.")
     else:
         warn(f"Configured host '{name}' is online but does not answer on the host "
-             f"service (port {port}). Start it there with: python wifi-handshake.py "
-             f"--serve --port {port}")
-        hit = hits[0]
+             f"service (ports {ports}). Start it there with: python "
+             f"wifi-handshake.py --serve (it picks the first free port).")
         if str(hit.get("os", "")).lower().startswith("win"):
             # A silent timeout on a Windows peer usually means the firewall
             # drops the port, not that the host is down.
             info(f"'{name}' runs Windows: if the host is running there but still "
                  f"unreachable, Windows Firewall is dropping the port. Allow it "
-                 f"in an admin PowerShell: {windows_firewall_hint(port)}")
+                 f"in an admin PowerShell: {windows_firewall_hint(ports)}")
 
 
-def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
+def discover_tailnet_towers(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
     """Return only the tailnet devices that run a tower."""
-    return [device for device in scan_tailnet_devices(port, status, timeout)
+    return [device for device in scan_tailnet_devices(ports, status, timeout)
             if device.get("tower")]
 
 
@@ -927,24 +1013,25 @@ def _use_device_anyway(device, port):
     return f"https://{host}:{port}", port
 
 
-def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
+def choose_tailnet_device(args, ports=None, timeout=TOWER_PROBE_TIMEOUT):
     """Interactive device picker: scan the tailnet, list devices, connect.
 
     Lists every reachable device (hosts marked), supports a name/IP filter,
-    ``r`` to rescan, ``m`` for a manual URL, ``p`` to change the port and ``q``
-    to cancel. Picking a device that did not answer as a host offers to use it
-    anyway instead of silently looping. The chosen host is kept for this
-    session only.
+    ``r`` to rescan, ``m`` for a manual URL, ``p`` to change the ports and ``q``
+    to cancel. Every candidate port is probed, so the host is found even when it
+    took a fallback port. Picking a device that did not answer as a host offers
+    to use it anyway instead of silently looping. The chosen host is kept for
+    this session only.
     """
-    port = port or getattr(args, "port", DEFAULT_PORT)
+    ports = normalize_ports(ports) if ports else configured_ports(args)
     status = tailscale_status()
     if not tailscale_ready(status):
         warn("Tailscale is not running.")
         if input("Log in to Tailscale now? [y/N] ").strip().lower() == "y":
             tailscale_login()
         return None
-    devices = scan_tailnet_devices(port, status, timeout)
-    warn_host_unavailable(devices, port)
+    devices = scan_tailnet_devices(ports, status, timeout)
+    warn_host_unavailable(devices, ports)
     query = None
     while True:
         heading("Devices in the tailnet")
@@ -953,46 +1040,46 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
                  or query in (device["ip"] or "")]
         print_tailnet_devices(shown)
         if not devices:
-            answer = input("[r]escan, [m]anual URL, [p]ort, [q]uit: ").strip().lower()
+            answer = input("[r]escan, [m]anual URL, [p]orts, [q]uit: ").strip().lower()
             if answer == "r":
-                devices = scan_tailnet_devices(port, status, timeout)
+                devices = scan_tailnet_devices(ports, status, timeout)
                 continue
             if answer == "m":
                 args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
                 return args.tower
             if answer == "p":
-                port = _ask_port(port, args)
-                devices = scan_tailnet_devices(port, status, timeout)
-                warn_host_unavailable(devices, port)
+                ports = _ask_ports(ports, args)
+                devices = scan_tailnet_devices(ports, status, timeout)
+                warn_host_unavailable(devices, ports)
                 continue
             return None
         has_tower = any(device.get("tower") for device in shown)
         if not has_tower:
-            info(f"No device answered as a host on port {port}. A device can be online "
-                 f"without running the host, or another service may occupy the port.")
+            info(f"No device answered as a host on {ports}. A device can be online "
+                 f"without running the host, or another service may occupy a port.")
         info(f"Number to pick, text to filter, r=rescan, m=manual URL, "
-             f"p=change port ({port}), q=cancel.")
+             f"p=change ports ({','.join(map(str, ports))}), q=cancel.")
         answer = input("Device: ").strip()
         low = answer.lower()
         if low in ("q", ""):
             return None
         if low == "r":
-            devices = scan_tailnet_devices(port, status, timeout)
+            devices = scan_tailnet_devices(ports, status, timeout)
             query = None
             continue
         if low == "m":
             args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
             return args.tower
         if low == "p":
-            port = _ask_port(port, args)
-            devices = scan_tailnet_devices(port, status, timeout)
-            warn_host_unavailable(devices, port)
+            ports = _ask_ports(ports, args)
+            devices = scan_tailnet_devices(ports, status, timeout)
+            warn_host_unavailable(devices, ports)
             query = None
             continue
         if answer.isdecimal() and 1 <= int(answer) <= len(shown):
             device = shown[int(answer) - 1]
             if not device.get("tower"):
-                chosen = _use_device_anyway(device, port)
+                chosen = _use_device_anyway(device, device.get("probe_port") or ports[0])
                 if chosen:
                     args.tower, port = chosen
                     args.port = port
@@ -1003,6 +1090,7 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
                      ).strip().lower() in ("n", "no"):
                 continue
             args.tower = device["url"]
+            args.port = device.get("probe_port") or ports[0]
             ok("Host set to " + args.tower)
             return args.tower
         query = low
@@ -1011,15 +1099,20 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
             query = None
 
 
-def _ask_port(current, args):
-    """Prompt for a host port and remember it for this session."""
-    raw = input(f"Host port [{current}]: ").strip()
-    if raw.isdecimal() and 0 < int(raw) < 65536:
-        args.port = int(raw)
-        return int(raw)
-    if raw:
-        warn("Enter a port between 1 and 65535.")
-    return current
+def _ask_ports(current, args):
+    """Prompt for one port or a comma-separated list and remember it."""
+    ports = normalize_ports(current)
+    raw = input(f"Host ports [{','.join(map(str, ports))}]: ").strip()
+    if not raw:
+        return ports
+    try:
+        chosen = port_list(raw)
+    except argparse.ArgumentTypeError as exc:
+        warn(str(exc))
+        return ports
+    args.ports = chosen
+    args.port = chosen[0]
+    return chosen
 
 
 def resolve_tower(args, name=None):
@@ -1035,8 +1128,7 @@ def resolve_tower(args, name=None):
         return None
     wanted = (name or getattr(args, "tower_name", None)
               or load_config().get("tower_name") or "tower")
-    port = getattr(args, "port", None) or DEFAULT_PORT
-    url = tailscale_tower_url(wanted, port)
+    url = tailscale_tower_url(wanted, configured_ports(args))
     if url:
         ok(f"Found tailnet peer '{wanted}': {url}")
         args.tower = url
@@ -2221,6 +2313,28 @@ def default_port():
         return DEFAULT_PORT
 
 
+def configured_ports(args=None):
+    """Candidate host ports, in order.
+
+    Precedence: ``--ports`` (list), then ``--port`` (single), then the
+    ``ports`` key in ``config.json``, then its ``port`` key, then
+    :data:`DEFAULT_PORTS`.
+    """
+    listed = getattr(args, "ports", None) if args is not None else None
+    if listed:
+        return normalize_ports(listed)
+    single = getattr(args, "port", None) if args is not None else None
+    if single:
+        return normalize_ports(single)
+    config = load_config()
+    listed = config.get("ports")
+    if isinstance(listed, (list, tuple)) and listed:
+        return normalize_ports(listed)
+    if config.get("port") is not None:
+        return normalize_ports(config.get("port"))
+    return list(DEFAULT_PORTS)
+
+
 def default_tools_dir():
     # Keep the GPU toolchain next to the script so hashcat's ./OpenCL kernels and
     # session logs stay inside the project instead of a shared installation.
@@ -3203,8 +3317,9 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
 
 def serve(args):
     host = getattr(args, "host", None) or args.bind
+    ports = configured_ports(args)
     config = TowerConfig(
-        host=host, port=args.port,
+        host=host, port=ports[0],
         jobs_dir=args.jobs_dir or (app_dir() / "jobs"),
         tools_dir=args.tools_dir or (app_dir() / "tools"),
         wordlist_dirs=args.wordlist_dirs or [app_dir() / "wordlists"],
@@ -3224,23 +3339,36 @@ def serve(args):
     if not tools.get("hashcat"):
         print("WARNING: hashcat not found. Jobs will fail until it is installed (--install-tools).")
     store = JobStore(config.jobs_dir)
-    worker = TowerWorker(store, config, tools)
-    worker.start()
-    try:
-        server = TowerServer((config.host, config.port), TowerHandler)
-    except OSError as exc:
-        worker.stop()
+    # Bind the first free port from the candidate list. A foreign service on the
+    # default port is no longer fatal: the next port is tried, and the client
+    # scans the same list, so host and client agree without manual coordination.
+    server = None
+    errors = []
+    for port in ports:
+        try:
+            server = TowerServer((config.host, port), TowerHandler)
+            config.port = port
+            break
+        except OSError as exc:
+            errors.append(f"{port}: {clean(str(exc))}")
+    if server is None:
         raise RuntimeError(
-            f"Could not listen on {config.host}:{config.port}: {clean(str(exc))}. "
-            f"Another service already uses this port. Start the host on a free port, "
-            f"e.g. python wifi-handshake.py --serve --port 9443, and connect the "
-            f"client with the same --port.") from exc
+            f"Could not listen on any of {ports} ({config.host}): "
+            + "; ".join(errors)
+            + ". Another service already uses every candidate port. Start the "
+              "host on a free port, e.g. python wifi-handshake.py --serve --port 9443.")
     server.store, server.config, server.tools = store, config, tools
     server.upload_semaphore = threading.BoundedSemaphore(4)
-    context = ensure_server_context(config)
-    if context:
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+    try:
+        context = ensure_server_context(config)
+        if context:
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+    except BaseException:
+        server.server_close()
+        raise
     scheme = "https" if context else "http"
+    worker = TowerWorker(store, config, tools)
+    worker.start()
     print(f"Host listening on {scheme}://{config.host}:{config.port}")
     print(f"Jobs: {config.jobs_dir}  Wordlists: {[str(d) for d in config.wordlist_dirs]}")
     tailnet = tailscale_status()
@@ -3249,9 +3377,9 @@ def serve(args):
               f"(use: --tower https://{tailnet['self_ip']}:{config.port})")
     if os.name == "nt":
         print("Windows Firewall drops inbound ports without a rule, so tailnet "
-              "clients may see this host as unreachable. Allow it (admin "
+              "clients may see this host as unreachable. Allow the ports (admin "
               "PowerShell):")
-        print("  " + windows_firewall_hint(config.port))
+        print("  " + windows_firewall_hint(ports))
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()
@@ -3993,6 +4121,14 @@ def self_test():
     # Tower: tailnet addresses prefer the SOCKS5 path in userspace mode.
     assert is_tailnet_address("100.105.183.20") and is_tailnet_address("fd7a:115c:a1e0::1")
     assert not is_tailnet_address("10.0.0.1") and not is_tailnet_address("tower")
+    # Multi-port fallback: port parsing and precedence.
+    assert normalize_ports(None) == [DEFAULT_PORT]
+    assert normalize_ports(8443) == [8443]
+    assert normalize_ports([8443, 9443, 0, "x", 70000]) == [8443, 9443]
+    assert port_list("8443, 9443") == [8443, 9443]
+    assert configured_ports(argparse.Namespace(ports=[9443], port=8443)) == [9443]
+    assert configured_ports(argparse.Namespace(port=9443)) == [9443]
+    assert DEFAULT_PORT in DEFAULT_PORTS
     # TCP keepalive is enabled on the sockets we hand out.
     with socket.socket() as _keep:
         _enable_keepalive(_keep)
@@ -4143,6 +4279,19 @@ def self_test():
     detail = {}
     assert probe_tower("127.0.0.1", 9, timeout=0.5, detail=detail) is None
     assert detail.get("error") == "no answer", detail
+    # Multi-port pre-flight: a closed port is skipped and the real host is found
+    # on a later port — the whole point of the fallback list.
+    _multi_httpd = http.server.HTTPServer(("127.0.0.1", 0), _HealthHandler)
+    threading.Thread(target=_multi_httpd.serve_forever, daemon=True).start()
+    try:
+        found = probe_tower_ports("127.0.0.1", [9, _multi_httpd.server_port], timeout=0.5)
+        assert found and found[2] == _multi_httpd.server_port, found
+        detail = {}
+        assert probe_tower_ports("127.0.0.1", [9, 10], timeout=0.3, detail=detail) is None
+        assert detail.get("error") == "no answer", detail
+        assert "8443,9443" in windows_firewall_hint([8443, 9443])
+    finally:
+        _multi_httpd.shutdown()
     busy = [{"hostname": "tower", "ip": "127.0.0.1", "online": True, "self": False,
              "latency": 1.0, "tower": False, "probe_port": 9, "probe_error": "HTTP 401"}]
     with contextlib.redirect_stdout(io.StringIO()) as probe_out:
@@ -4468,14 +4617,15 @@ def local_menu(args):
             run_local(args)
 
 
-def add_windows_firewall_rule(port):
-    """Add an inbound TCP rule for ``port`` via PowerShell. Returns success.
+def add_windows_firewall_rule(ports):
+    """Add an inbound TCP rule for ``ports`` via PowerShell. Returns success.
 
     Only meaningful on Windows, where Defender Firewall silently drops inbound
     packets on ports without a rule, making a running host look unreachable.
     """
+    label = ",".join(map(str, ports)) if isinstance(ports, (list, tuple, set)) else str(ports)
     command = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-               windows_firewall_hint(port)]
+               windows_firewall_hint(ports)]
     try:
         result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, timeout=60,
@@ -4484,49 +4634,102 @@ def add_windows_firewall_rule(port):
         warn(f"Could not run PowerShell: {clean(str(exc))}")
         return False
     if result.returncode == 0:
-        ok(f"Firewall rule added for port {port}.")
+        ok(f"Firewall rule added for port(s) {label}.")
         return True
     warn(f"Could not add the firewall rule (exit {result.returncode}).")
     if (result.stderr or "").strip():
         print("  " + clean(result.stderr.strip().splitlines()[0]))
     print("Run this in an admin PowerShell:")
-    print("  " + windows_firewall_hint(port))
+    print("  " + windows_firewall_hint(ports))
     return False
 
 
+def connection_test(args, timeout=TOWER_PROBE_TIMEOUT):
+    """Probe the configured host on every candidate port and report the result.
+
+    This is the manual pre-flight check: it runs the same health handshake the
+    client uses before an upload, so it shows exactly what a real send would do.
+    On success it sets ``args.tower``/``args.port`` and returns the port.
+    """
+    ports = configured_ports(args)
+    host = label = peer_os = None
+    tower = getattr(args, "tower", None)
+    if tower:
+        parsed = urllib.parse.urlsplit(tower if "://" in tower else "https://" + tower)
+        host, label = parsed.hostname, tower
+    else:
+        name = getattr(args, "tower_name", None) or load_config().get("tower_name")
+        if name and tailscale_available():
+            peer = tailscale_peer(name, tailscale_status())
+            if peer:
+                host = peer["ip"] or peer["dns_name"]
+                peer_os = peer.get("os")
+                label = f"{name} ({host})"
+    if not host:
+        warn("No host to test. Pick one under Setup -> Devices, or pass --tower URL.")
+        return None
+    info(f"Pre-flight check for {label} on ports {ports} ...")
+    for port in ports:
+        detail = {}
+        found = probe_tower(host, port, timeout, detail)
+        if found:
+            args.tower = f"{found[0]}://{host}:{port}"
+            args.port = port
+            ok(f"{host}:{port} is a wifi-handshake host ({found[0]})")
+            ok("Host ready: " + args.tower)
+            return port
+        reason = detail.get("error") or "no answer"
+        if port_answered(reason):
+            warn(f"{host}:{port} -> {reason} (another service uses this port)")
+        else:
+            info(f"{host}:{port} -> {reason}")
+    warn(f"No wifi-handshake host answered on {ports}.")
+    info("On the host, run: python wifi-handshake.py --serve (it picks the first free port).")
+    if str(peer_os or "").lower().startswith("win"):
+        info(f"'{label}' runs Windows: if the host is running but unreachable, allow "
+             f"the ports (admin PowerShell): {windows_firewall_hint(ports)}")
+    return None
+
+
 def menu_firewall(args):
-    """Show how to open the host port for tailnet clients, and add it on Windows."""
-    port = getattr(args, "port", None) or DEFAULT_PORT
-    heading(f"Firewall - open port {port}")
+    """Show how to open the host ports for tailnet clients, and add it on Windows."""
+    ports = configured_ports(args)
+    label = ",".join(map(str, ports))
+    heading(f"Firewall - open ports {label}")
     info("The rule belongs on the host that runs --serve (the GPU box), not on this client.")
     if os.name == "nt":
         print("Windows drops inbound ports without a rule. Add one (admin PowerShell):")
-        print("  " + windows_firewall_hint(port))
+        print("  " + windows_firewall_hint(ports))
         if input("Run it now? (needs an admin shell) [y/N] ").strip().lower() in ("y", "yes"):
-            add_windows_firewall_rule(port)
+            add_windows_firewall_rule(ports)
     else:
         print("If the host is Windows, run this there in an admin PowerShell:")
-        print("  " + windows_firewall_hint(port))
+        print("  " + windows_firewall_hint(ports))
         print("If the host is Linux, a firewall rule is usually unnecessary. With ufw:")
-        print(f"  sudo ufw allow {port}/tcp")
+        for port in ports:
+            print(f"  sudo ufw allow {port}/tcp")
         print("With firewalld:")
-        print(f"  sudo firewall-cmd --add-port={port}/tcp --permanent "
+        print(f"  sudo firewall-cmd --add-port={label}/tcp --permanent "
               f"&& sudo firewall-cmd --reload")
 
 
 def menu_setup(args):
-    """Setup submenu: Tailscale, devices, firewall, host port, help/install."""
+    """Setup submenu: Tailscale, devices, connection test, firewall, ports, tools."""
     while True:
+        ports = configured_ports(args)
+        label = ",".join(map(str, ports))
         heading("Setup")
         print("  " + style("1", "bold") + ". Tailscale           "
               + style("(status, log in, pick the host in your tailnet)", "dim"))
         print("  " + style("2", "bold") + ". Devices             "
               + style("(list reachable tailnet devices, pick the host)", "dim"))
-        print("  " + style("3", "bold") + ". Firewall            "
-              + style("(open the host port for tailnet clients)", "dim"))
-        print("  " + style("4", "bold") + ". Host port           "
-              + style(f"(current: {getattr(args, 'port', None) or DEFAULT_PORT})", "dim"))
-        print("  " + style("5", "bold") + ". Help / Install      "
+        print("  " + style("3", "bold") + ". Connection test     "
+              + style("(pre-flight: probe the host across the ports)", "dim"))
+        print("  " + style("4", "bold") + ". Firewall            "
+              + style("(open the host ports for tailnet clients)", "dim"))
+        print("  " + style("5", "bold") + ". Host ports          "
+              + style(f"(current: {label})", "dim"))
+        print("  " + style("6", "bold") + ". Help / Install      "
               + style("(--help, download hashcat)", "dim"))
         print("  " + style("b", "bold") + "  Back")
         choice = input(style("Setup choice: ", "bold")).strip().lower()
@@ -4543,11 +4746,12 @@ def menu_setup(args):
         elif choice == "2":
             choose_tailnet_device(args)
         elif choice == "3":
-            menu_firewall(args)
+            connection_test(args)
         elif choice == "4":
-            port = _ask_port(getattr(args, "port", None) or DEFAULT_PORT, args)
-            ok(f"Host port set to {port} for this session.")
+            menu_firewall(args)
         elif choice == "5":
+            _ask_ports(ports, args)
+        elif choice == "6":
             print("Installing hashcat ...")
             install_tools(args.tools_dir)
         elif choice in ("b", "", "q"):
@@ -4576,7 +4780,7 @@ def run_interactive(args):
         print("  " + style("6", "bold") + ". Compute locally    "
               + style("(hashcat on this GPU: new, resume, restore, attach)", "dim"))
         print("  " + style("7", "bold") + ". Setup              "
-              + style("(Tailscale, firewall, host port, help/install)", "dim"))
+              + style("(Tailscale, firewall, ports, help/install)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
@@ -4671,8 +4875,13 @@ No deauthentication, injection or radio interference anywhere in this tool.
 Only test networks you own or have permission to test.
 """)
     parser.add_argument("--tower", help="host base URL, e.g. https://tower:8443")
+    parser.add_argument("--ports", type=port_list,
+                        help="comma-separated host ports to try in order "
+                             "(default: config.json 'ports', else "
+                             + ",".join(map(str, DEFAULT_PORTS)) + ")")
     parser.add_argument("--port", type=int,
-                        help=f"host port (default: config.json 'port', else {DEFAULT_PORT})")
+                        help="single host port, used when --ports is not given "
+                             f"(default: config.json 'port', else {DEFAULT_PORT})")
     parser.add_argument("--bind", default="0.0.0.0", help="server bind address, default 0.0.0.0")
     parser.add_argument("--tools-dir", type=Path, help="folder holding hashcat")
     parser.add_argument("--output-dir", type=Path,
@@ -4940,8 +5149,12 @@ def run_headless(args):
 
 def main(argv=None):
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.ports is None and args.port is None:
+        # No explicit choice: use config.json ("ports", else "port") or the
+        # DEFAULT_PORTS fallback, and materialise it as a list.
+        args.ports = configured_ports(args)
     if args.port is None:
-        args.port = default_port()
+        args.port = args.ports[0] if args.ports else default_port()
     try:
         if args.self_test:
             self_test()
@@ -4963,15 +5176,16 @@ def main(argv=None):
             if not tailscale_ready():
                 warn("Tailscale is not running. Start it with `sudo tailscale up`.")
                 return 1
-            print_tailnet_towers(discover_tailnet_towers(args.port))
+            print_tailnet_towers(discover_tailnet_towers(configured_ports(args)))
             return 0
         if args.list_devices:
             if not tailscale_ready():
                 warn("Tailscale is not running. Start it with `sudo tailscale up`.")
                 return 1
-            devices = scan_tailnet_devices(args.port, timeout=TOWER_PROBE_TIMEOUT)
+            ports = configured_ports(args)
+            devices = scan_tailnet_devices(ports, timeout=TOWER_PROBE_TIMEOUT)
             print_tailnet_devices(devices)
-            warn_host_unavailable(devices, args.port)
+            warn_host_unavailable(devices, ports)
             return 0
         if args.local or args.local_capture or args.resume or args.restore_job:
             return run_local(args)

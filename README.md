@@ -136,7 +136,7 @@ wifi-handshake - Terminal Menu
   4. Inspect capture    (offline: find/verify a handshake in a file)
   5. Example captures   (download public test data)
   6. Compute locally    (hashcat on this GPU: new, resume, restore, attach)
-  7. Setup              (Tailscale, firewall, host port, help/install)
+  7. Setup              (Tailscale, firewall, ports, help/install)
   q  Quit
 ```
 
@@ -146,17 +146,30 @@ The **Setup** menu (item **7**) groups the environment helpers:
 Setup
   1. Tailscale          (status, log in, pick the host in your tailnet)
   2. Devices            (list reachable tailnet devices, pick the host)
-  3. Firewall           (open the host port for tailnet clients)
-  4. Host port          (change the port used by host and client)
-  5. Help / Install     (--help, download hashcat)
+  3. Connection test    (pre-flight: probe the host across the ports)
+  4. Firewall           (open the host ports for tailnet clients)
+  5. Host ports         (change the port list used by host and client)
+  6. Help / Install     (--help, download hashcat)
   b  Back
 ```
 
-On Windows, **Setup → 3 – Firewall** adds the inbound rule for the current
-port with `New-NetFirewallRule` (an admin shell is required); without it
-Defender Firewall silently drops the port, so a running host looks
+**Setup → 3 – Connection test** runs the same health handshake the client uses
+before an upload against every candidate port and reports which port runs the
+host (foreign services are marked). It is the quickest way to check a
+host/client pair before a send.
+
+**Ports:** the host binds the **first free port** from a candidate list
+(`8443,9443,10443,11443,12443` by default) and the client probes the same list,
+so host and client agree without manual coordination. Change it with
+`--ports 8443,9443,...`, a single `--port N`, or `config.json`. The defaults sit
+below the OS ephemeral ranges (Linux 32768–60999, Windows 49152–65535), so a
+running host never loses its port to an outgoing connection.
+
+On Windows, **Setup → 4 – Firewall** adds one inbound rule for the whole port
+list with `New-NetFirewallRule` (an admin shell is required); without it
+Defender Firewall silently drops the ports, so a running host looks
 unreachable from the tailnet. On Linux it prints the matching `ufw`/
-`firewalld` command instead.
+`firewalld` commands instead.
 
 The menu stays open after each action. After a successful capture it asks what
 to do with the file (menu item 1 → capture → "Send to a host (s), compute
@@ -190,7 +203,7 @@ python wifi-handshake.py --resume 20260924-120000-ab12cd34 # re-run its attack
 python wifi-handshake.py --restore 20260924-120000-ab12cd34 # resume its session
 ```
 Options:
-`--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
+`--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--ports N,N`, `--port N`, `--insecure`,
 `--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
 `--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
 `--discover-towers`, `--list-devices`, `--local`, `--local-capture FILE`,
@@ -240,7 +253,8 @@ and builds the host URL from its **tailnet IP**, e.g.
 reachable device** in the tailnet — hostname, IP, ping latency, and (for
 hosts) GPU backend and hashcat version. This device is marked with `*`, real
 hosts are detected via the **health handshake** (`/api/v1/health`, HTTPS first,
-then HTTP). The device picker supports filtering by typing a name/IP:
+then HTTP) across **every candidate port**. The device picker supports
+filtering by typing a name/IP:
 
 ```
   #  Host                     IP              Ping  Backend   Hashcat
@@ -251,19 +265,19 @@ then HTTP). The device picker supports filtering by typing a name/IP:
 
 Menu item **3 – Send capture** always opens this list first: pick a device
 (number), confirm, and the capture is uploaded. `r` rescans, `m` enters a
-manual URL, `p` changes the port, `q` cancels. Picking a device that did **not**
-answer as a host no longer loops: the tool reports why (e.g. `HTTP 401` from a
-foreign service on that port) and offers to try it anyway. The chosen host is
+manual URL, `p` changes the port list, `q` cancels. Picking a device that did
+**not** answer as a host no longer loops: the tool reports why (e.g. `HTTP 401`
+from a foreign service on a port) and offers to try it anyway. The chosen host is
 kept for the current session only. When Tailscale is not running the tool offers
 to log in instead of failing. `--discover-towers` lists only the actual hosts.
 If the configured default host (see `config.json`) is online but another service
-already answers on the port, the tool says so and suggests a free port; if the
-host simply is not running, it prints the exact `--serve` command to start it.
+already answers on a port, the tool says so and points at the fallback list; if
+the host simply is not running, it prints the exact `--serve` command to start it.
 Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
 `--tower-name` and never prompt.
 
-`--serve` prints the tailnet IP the host is reachable at, e.g.
-`use: --tower https://100.x.y.z:8443`.
+`--serve` prints the tailnet IP and the port it actually bound, e.g.
+`use: --tower https://100.x.y.z:9443`.
 
 If Tailscale is not installed or the daemon is not running the helpers only warn
 and the tool keeps working with an explicit `--tower URL`. A userspace daemon
@@ -325,7 +339,8 @@ Optional settings that are read automatically on every run:
 |---|---|
 | `tailscale_socket` | socket path of a root-less `tailscaled` daemon |
 | `tower_name` | default tailnet hostname of the host (e.g. `jannistower`) |
-| `port` | default host port (set it once if 8443 is taken by another service) |
+| `ports` | ordered list of candidate host ports (host binds the first free one, client scans them) |
+| `port` | single host port, used when `ports` is not set |
 
 Example:
 
@@ -333,7 +348,7 @@ Example:
 {
   "tailscale_socket": "/run/user/1000/tailscaled.sock",
   "tower_name": "jannistower",
-  "port": 9443
+  "ports": [8443, 9443, 10443]
 }
 ```
 
@@ -378,21 +393,23 @@ their own devices reconnect, no deauthentication needed.
 ### Step 1 – Start the host (Windows)
 Via menu item **2 – Start host** or directly:
 ```
-python wifi-handshake.py --serve --port 8443
+python wifi-handshake.py --serve
 ```
 ```
 Host tools: hashcat=...\tools\hashcat-7.1.2\hashcat.exe
 GPU backend: cuda
   CUDA GPU: NVIDIA GeForce RTX 4070 SUPER
-https://0.0.0.0:8443 listening
+Host listening on https://0.0.0.0:9443
 ```
 A self-signed certificate is created automatically on first start
 (`~/.wifi-handshake/tower-cert.pem` / `tower-key.pem`).
 
-If `--serve` reports that the port is **already in use**, another program (not
-this host) owns it. Pick a free port, e.g. `--serve --port 9443`, and connect
-the client with the same `--port`. The device list marks such a collision as
-`! HTTP 401` (or another status) instead of `(no host)`.
+`--serve` binds the **first free port** from the candidate list (default
+`8443,9443,10443,11443,12443`) and prints it, so a foreign service on 8443 no
+longer blocks the host. The client scans the same list — nothing to coordinate.
+Override the list with `--ports 8443,9443,...` or a single `--port N`. If a
+foreign service answers on a port, the device list marks it `! HTTP 401` (or
+another status) instead of `(no host)`, and the client keeps scanning the rest.
 
 ### Step 2 – Capture a handshake (Laptop)
 Via menu item **1 – Capture handshake** (or `--run-capture`):
@@ -549,7 +566,7 @@ project folder, new captures are written to `captures/` (override with
 | Upload always fails / "connection reset" | old hosts crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the host with this build; the limit now defaults to 64 MiB. |
 | hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
 | "No host set" | set the host URL with `--tower URL` or enter it in menu item 3. |
-| Device list shows `! HTTP 401` (or another status) instead of a host | another service already listens on that port on the host. Start the host on a free port (`--serve --port 9443`) and connect with the same `--port`. |
+| Device list shows `! HTTP 401` (or another status) instead of a host | another service already listens on that port. Run `--serve` (without `--port`): it picks the first free port from the list and the client scans the same list. Verify with **Setup → 3 – Connection test**. |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
 
 ---
