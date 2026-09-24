@@ -92,7 +92,7 @@ wifi-handshaker/
   required.
 * The host does not need to be publicly reachable — Tailscale handles NAT traversal.
 * Join the tailnet on each device with `sudo tailscale up`, or from the tool with
-  `python wifi-handshake.py --tailscale-login` (menu item **7 – Tailscale**).
+  `python wifi-handshake.py --tailscale-login` (menu: **7 Setup → 1 Tailscale**).
   `--tailscale-status` shows the peers and their tailnet IPs.
 
 ---
@@ -104,8 +104,8 @@ wifi-handshaker/
 python wifi-handshake.py --install-tools
 ```
 Downloads the pinned `hashcat` version from GitHub, verifies the SHA256
-checksum and unpacks it into `tools\`. Alternatively use menu item
-**Install hashcat**.
+checksum and unpacks it into `tools\`. Alternatively use the Setup menu
+(**7 → 5 Help / Install**).
 
 > **Conversion is built in:** raw `.pcapng`/`.pcap` captures are converted to
 > `.hc22000` by a pure-Python parser inside `wifi-handshake.py` — no tshark or
@@ -133,14 +133,30 @@ wifi-handshake - Terminal Menu
   1. Capture handshake  (Linux, monitor mode, root)
   2. Start host         (server + hashcat, for the GPU box)
   3. Send capture       (client: list tailnet devices, then upload)
-  4. Help / Install     (--help, download hashcat)
-  5. Inspect capture    (offline: find/verify a handshake in a file)
-  6. Example captures   (download public test data)
-  7. Tailscale          (status, log in, pick the host in your tailnet)
-  8. Devices            (list reachable tailnet devices, pick the host)
-  9. Compute locally    (hashcat on this GPU: new, resume, restore, attach)
+  4. Inspect capture    (offline: find/verify a handshake in a file)
+  5. Example captures   (download public test data)
+  6. Compute locally    (hashcat on this GPU: new, resume, restore, attach)
+  7. Setup              (Tailscale, firewall, host port, help/install)
   q  Quit
 ```
+
+The **Setup** menu (item **7**) groups the environment helpers:
+
+```
+Setup
+  1. Tailscale          (status, log in, pick the host in your tailnet)
+  2. Devices            (list reachable tailnet devices, pick the host)
+  3. Firewall           (open the host port for tailnet clients)
+  4. Host port          (change the port used by host and client)
+  5. Help / Install     (--help, download hashcat)
+  b  Back
+```
+
+On Windows, **Setup → 3 – Firewall** adds the inbound rule for the current
+port with `New-NetFirewallRule` (an admin shell is required); without it
+Defender Firewall silently drops the port, so a running host looks
+unreachable from the tailnet. On Linux it prints the matching `ufw`/
+`firewalld` command instead.
 
 The menu stays open after each action. After a successful capture it asks what
 to do with the file (menu item 1 → capture → "Send to a host (s), compute
@@ -187,7 +203,7 @@ cracks a capture on this machine's GPU, using the identical tool discovery,
 attack builder, `job_timeout` and job store under `~/.wifi-handshake/jobs/`.
 No HTTP/WebSocket/Tailscale is involved.
 
-* `--local-capture FILE` (or menu item **9 → n**) starts a new local job.
+* `--local-capture FILE` (or menu item **6 → n**) starts a new local job.
 * `--watch JOB_ID` reattaches to a job and prints live status (local job first,
   remote host otherwise).
 * `--resume JOB_ID` re-runs a stored job's attack; the shared potfile makes
@@ -220,7 +236,7 @@ and builds the host URL from its **tailnet IP**, e.g.
 `https://100.x.y.z:<port>` (defaults to the `tower_name` setting in
 `~/.wifi-handshake/config.json`, or `tower`).
 
-**Device list:** `--list-devices` and menu item **8 – Devices** list **every
+**Device list:** `--list-devices` and the Setup menu (**7 → 2 Devices**) list **every
 reachable device** in the tailnet — hostname, IP, ping latency, and (for
 hosts) GPU backend and hashcat version. This device is marked with `*`, real
 hosts are detected via the **health handshake** (`/api/v1/health`, HTTPS first,

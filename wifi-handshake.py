@@ -382,7 +382,7 @@ def print_tailscale_status(status=None):
         ok(summary)
     else:
         warn(summary)
-        info("Run `sudo tailscale up` (or menu item 7) to join the tailnet.")
+        info("Run `sudo tailscale up` (or menu: 7 Setup -> 1 Tailscale) to join the tailnet.")
         return status
     if not status["peers"]:
         info("No peers in the tailnet yet.")
@@ -4165,6 +4165,18 @@ def self_test():
         assert "New-NetFirewallRule" in win_out.getvalue(), win_out.getvalue()
     finally:
         globals()["load_config"] = _real_config
+    # Setup -> Firewall prints the exact rule for the current port.
+    import builtins
+    _real_input2 = builtins.input
+    try:
+        builtins.input = lambda *a, **k: "n"
+        with contextlib.redirect_stdout(io.StringIO()) as _fw_out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            menu_firewall(argparse.Namespace(port=9443))
+        assert "New-NetFirewallRule" in _fw_out.getvalue()
+        assert "9443" in _fw_out.getvalue()
+    finally:
+        builtins.input = _real_input2
     # Picking a device that is not a host offers to use it anyway instead of
     # looping; answering "no" returns to the picker.
     import builtins
@@ -4425,7 +4437,7 @@ def menu_capture(args):
 
 
 def local_menu(args):
-    """Interactive entry point for local cracking (menu item 9)."""
+    """Interactive entry point for local cracking (menu item 6)."""
     heading("Compute locally on this machine")
     info("Runs hashcat on the local GPU using the same engine as the host.")
     answer = input("[n]ew job, [r]esume job, [s]ession restore, [a]ttach to job, "
@@ -4456,6 +4468,94 @@ def local_menu(args):
             run_local(args)
 
 
+def add_windows_firewall_rule(port):
+    """Add an inbound TCP rule for ``port`` via PowerShell. Returns success.
+
+    Only meaningful on Windows, where Defender Firewall silently drops inbound
+    packets on ports without a rule, making a running host look unreachable.
+    """
+    command = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+               windows_firewall_hint(port)]
+    try:
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=60,
+                                encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"Could not run PowerShell: {clean(str(exc))}")
+        return False
+    if result.returncode == 0:
+        ok(f"Firewall rule added for port {port}.")
+        return True
+    warn(f"Could not add the firewall rule (exit {result.returncode}).")
+    if (result.stderr or "").strip():
+        print("  " + clean(result.stderr.strip().splitlines()[0]))
+    print("Run this in an admin PowerShell:")
+    print("  " + windows_firewall_hint(port))
+    return False
+
+
+def menu_firewall(args):
+    """Show how to open the host port for tailnet clients, and add it on Windows."""
+    port = getattr(args, "port", None) or DEFAULT_PORT
+    heading(f"Firewall - open port {port}")
+    info("The rule belongs on the host that runs --serve (the GPU box), not on this client.")
+    if os.name == "nt":
+        print("Windows drops inbound ports without a rule. Add one (admin PowerShell):")
+        print("  " + windows_firewall_hint(port))
+        if input("Run it now? (needs an admin shell) [y/N] ").strip().lower() in ("y", "yes"):
+            add_windows_firewall_rule(port)
+    else:
+        print("If the host is Windows, run this there in an admin PowerShell:")
+        print("  " + windows_firewall_hint(port))
+        print("If the host is Linux, a firewall rule is usually unnecessary. With ufw:")
+        print(f"  sudo ufw allow {port}/tcp")
+        print("With firewalld:")
+        print(f"  sudo firewall-cmd --add-port={port}/tcp --permanent "
+              f"&& sudo firewall-cmd --reload")
+
+
+def menu_setup(args):
+    """Setup submenu: Tailscale, devices, firewall, host port, help/install."""
+    while True:
+        heading("Setup")
+        print("  " + style("1", "bold") + ". Tailscale           "
+              + style("(status, log in, pick the host in your tailnet)", "dim"))
+        print("  " + style("2", "bold") + ". Devices             "
+              + style("(list reachable tailnet devices, pick the host)", "dim"))
+        print("  " + style("3", "bold") + ". Firewall            "
+              + style("(open the host port for tailnet clients)", "dim"))
+        print("  " + style("4", "bold") + ". Host port           "
+              + style(f"(current: {getattr(args, 'port', None) or DEFAULT_PORT})", "dim"))
+        print("  " + style("5", "bold") + ". Help / Install      "
+              + style("(--help, download hashcat)", "dim"))
+        print("  " + style("b", "bold") + "  Back")
+        choice = input(style("Setup choice: ", "bold")).strip().lower()
+        if choice == "1":
+            print_tailscale_status()
+            answer = input("Action: [Enter] back, l to log in, t to pick a peer, "
+                           "d to list devices + connect: ").strip().lower()
+            if answer == "l":
+                tailscale_login()
+            elif answer == "t":
+                choose_tailscale_tower(args)
+            elif answer == "d":
+                choose_tailnet_device(args)
+        elif choice == "2":
+            choose_tailnet_device(args)
+        elif choice == "3":
+            menu_firewall(args)
+        elif choice == "4":
+            port = _ask_port(getattr(args, "port", None) or DEFAULT_PORT, args)
+            ok(f"Host port set to {port} for this session.")
+        elif choice == "5":
+            print("Installing hashcat ...")
+            install_tools(args.tools_dir)
+        elif choice in ("b", "", "q"):
+            return
+        else:
+            warn("Invalid choice.")
+
+
 def run_interactive(args):
     while True:
         # Clear per-action selections so a previous action cannot leak into the
@@ -4469,18 +4569,14 @@ def run_interactive(args):
               + style("(server + hashcat, for the GPU box)", "dim"))
         print("  " + style("3", "bold") + ". Send capture       "
               + style("(client: list tailnet devices, then upload)", "dim"))
-        print("  " + style("4", "bold") + ". Help / Install     "
-              + style("(--help, download hashcat)", "dim"))
-        print("  " + style("5", "bold") + ". Inspect capture    "
+        print("  " + style("4", "bold") + ". Inspect capture    "
               + style("(offline: find/verify a handshake in a file)", "dim"))
-        print("  " + style("6", "bold") + ". Example captures   "
+        print("  " + style("5", "bold") + ". Example captures   "
               + style("(download public test data)", "dim"))
-        print("  " + style("7", "bold") + ". Tailscale          "
-              + style("(status, log in, pick the host in your tailnet)", "dim"))
-        print("  " + style("8", "bold") + ". Devices            "
-              + style("(list reachable tailnet devices, pick the host)", "dim"))
-        print("  " + style("9", "bold") + ". Compute locally    "
+        print("  " + style("6", "bold") + ". Compute locally    "
               + style("(hashcat on this GPU: new, resume, restore, attach)", "dim"))
+        print("  " + style("7", "bold") + ". Setup              "
+              + style("(Tailscale, firewall, host port, help/install)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
@@ -4515,10 +4611,6 @@ def run_interactive(args):
             run_headless(args)
             continue
         if choice == "4":
-            print("Installing hashcat ...")
-            install_tools(args.tools_dir)
-            continue
-        if choice == "5":
             cap = input("Capture file (.pcap/.pcapng): ").strip()
             if not cap:
                 continue
@@ -4528,26 +4620,15 @@ def run_interactive(args):
                 password = getpass.getpass("Passphrase (optional): ") or None
             inspect_capture(Path(cap), essid, password)
             continue
-        if choice == "6":
+        if choice == "5":
             target = input("Target directory [examples]: ").strip() or "examples"
             download_example_captures(Path(target), args.captures_repo)
             continue
-        if choice == "7":
-            print_tailscale_status()
-            answer = input("Action: [Enter] back, l to log in, t to pick a peer, "
-                           "d to list devices + connect: ").strip().lower()
-            if answer == "l":
-                tailscale_login()
-            elif answer == "t":
-                choose_tailscale_tower(args)
-            elif answer == "d":
-                choose_tailnet_device(args)
-            continue
-        if choice == "8":
-            choose_tailnet_device(args)
-            continue
-        if choice == "9":
+        if choice == "6":
             local_menu(args)
+            continue
+        if choice == "7":
+            menu_setup(args)
             continue
         if choice in ("q", ""):
             return 0
