@@ -63,10 +63,13 @@ import uuid
 # Windows console: when stdout/stderr is redirected, Python falls back to the
 # ANSI codepage (e.g. cp1252), which cannot encode the ✓ and emoji used in the
 # UI and would crash the menu on any non-ASCII output. Force UTF-8 with lossy
-# replacement so output can never raise UnicodeEncodeError.
+# replacement so output can never raise UnicodeEncodeError. Line buffering
+# keeps --serve output visible immediately when it is redirected to a file
+# (nohup, service, log), instead of sitting in the block buffer.
 for _output_stream in (sys.stdout, sys.stderr):
     try:
-        _output_stream.reconfigure(encoding="utf-8", errors="replace")
+        _output_stream.reconfigure(encoding="utf-8", errors="replace",
+                                   line_buffering=True)
     except (AttributeError, OSError, ValueError):
         pass
 
