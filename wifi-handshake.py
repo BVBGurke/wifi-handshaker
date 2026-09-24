@@ -549,6 +549,18 @@ def _socks5_address(host):
     return b"\x03" + bytes([len(name)]) + name
 
 
+SOCKS5_ERRORS = {
+    0x01: "general SOCKS server failure",
+    0x02: "connection not allowed by ruleset",
+    0x03: "network unreachable",
+    0x04: "host unreachable",
+    0x05: "connection refused (nothing listens on the port)",
+    0x06: "TTL expired",
+    0x07: "command not supported",
+    0x08: "address type not supported",
+}
+
+
 def _socks5_connect(proxy, host, port, timeout):
     """Connect ``host:port`` through a SOCKS5 proxy and return the socket."""
     proxy_host, proxy_port = proxy
@@ -562,7 +574,9 @@ def _socks5_connect(proxy, host, port, timeout):
         sock.sendall(b"\x05\x01\x00" + _socks5_address(host) + struct.pack(">H", port))
         header = _socks5_recv_exact(sock, 4)
         if len(header) != 4 or header[0] != 0x05 or header[1] != 0:
-            raise OSError("SOCKS5 connect failed.")
+            code = header[1] if len(header) > 1 else 0
+            reason = SOCKS5_ERRORS.get(code, f"unknown error 0x{code:02x}")
+            raise OSError(f"SOCKS5 connect failed: {reason}.")
         if header[3] == 1:
             _socks5_recv_exact(sock, 6)
         elif header[3] == 4:
@@ -818,6 +832,18 @@ def print_tailnet_devices(devices):
              f"already uses it; start the host on a free port.")
 
 
+def windows_firewall_hint(port):
+    """PowerShell command that lets the host port through Windows Firewall.
+
+    Windows drops unsolicited inbound packets on ports without an allow rule,
+    so a host that is running can still look unreachable from the tailnet. The
+    symptom is a *silent* timeout (no RST), unlike a normal closed port.
+    """
+    return (f'New-NetFirewallRule -DisplayName "wifi-handshaker {port}" '
+            f'-Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} '
+            f'-Profile Any')
+
+
 def warn_host_unavailable(devices, port=DEFAULT_PORT):
     """Warn when the configured default host is online but not serving the host service.
 
@@ -844,6 +870,13 @@ def warn_host_unavailable(devices, port=DEFAULT_PORT):
         warn(f"Configured host '{name}' is online but does not answer on the host "
              f"service (port {port}). Start it there with: python wifi-handshake.py "
              f"--serve --port {port}")
+        hit = hits[0]
+        if str(hit.get("os", "")).lower().startswith("win"):
+            # A silent timeout on a Windows peer usually means the firewall
+            # drops the port, not that the host is down.
+            info(f"'{name}' runs Windows: if the host is running there but still "
+                 f"unreachable, Windows Firewall is dropping the port. Allow it "
+                 f"in an admin PowerShell: {windows_firewall_hint(port)}")
 
 
 def discover_tailnet_towers(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
@@ -3214,6 +3247,11 @@ def serve(args):
     if tailnet and tailnet["state"] == "Running" and tailnet["self_ip"]:
         print(f"Reachable in the tailnet as {tailnet['self_ip']} "
               f"(use: --tower https://{tailnet['self_ip']}:{config.port})")
+    if os.name == "nt":
+        print("Windows Firewall drops inbound ports without a rule, so tailnet "
+              "clients may see this host as unreachable. Allow it (admin "
+              "PowerShell):")
+        print("  " + windows_firewall_hint(config.port))
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()
@@ -4110,6 +4148,23 @@ def self_test():
     with contextlib.redirect_stdout(io.StringIO()) as probe_out:
         print_tailnet_devices(busy)
     assert "another service" in probe_out.getvalue()
+    # A Windows peer that silently times out (firewall drop) gets a concrete
+    # firewall hint, because a dropped port looks like a dead host otherwise.
+    assert SOCKS5_ERRORS[0x05].startswith("connection refused")
+    assert "New-NetFirewallRule" in windows_firewall_hint(9443)
+    assert "9443" in windows_firewall_hint(9443)
+    _real_config = load_config
+    try:
+        globals()["load_config"] = lambda: {"tower_name": "tower"}
+        _win = [{"hostname": "tower", "ip": "1.2.3.4", "os": "windows",
+                 "online": True, "self": False, "latency": None, "tower": False,
+                 "probe_port": 9443, "probe_error": "no answer"}]
+        with contextlib.redirect_stdout(io.StringIO()) as win_out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            warn_host_unavailable(_win, 9443)
+        assert "New-NetFirewallRule" in win_out.getvalue(), win_out.getvalue()
+    finally:
+        globals()["load_config"] = _real_config
     # Picking a device that is not a host offers to use it anyway instead of
     # looping; answering "no" returns to the picker.
     import builtins
