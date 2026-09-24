@@ -44,6 +44,17 @@ from a shell (`--run-capture`).
 * **One file for everything**: `wifi-handshake.py` contains the engine and the
   terminal menu. The mode (capture / host / client) is chosen in the menu.
 
+The repository keeps the engine in one file and everything else in folders:
+
+```
+wifi-handshaker/
+├── wifi-handshake.py    # engine + menu (the whole tool)
+├── examples/            # committed synthetic capture used by --self-test
+├── captures/            # captured handshakes (created on demand, git-ignored)
+├── README.md · LICENSE · SECURITY.md
+└── .github/workflows/   # CI: compile check + --self-test
+```
+
 ---
 
 ## 2. Requirements
@@ -223,13 +234,16 @@ then HTTP). The device picker supports filtering by typing a name/IP:
 ```
 
 Menu item **3 – Send capture** always opens this list first: pick a device
-(number), confirm, and the capture is uploaded. `r` rescans, `q` cancels, and a
-manual URL is only offered when **no host** was found. The chosen host is kept
-for the current session only. When Tailscale is not running the tool offers to
-log in instead of failing. `--discover-towers` lists only the actual hosts.
-If the configured default host (see `config.json`) is online but not serving
-the host service, both the list and the picker print the exact command to start
-it there. Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
+(number), confirm, and the capture is uploaded. `r` rescans, `m` enters a
+manual URL, `p` changes the port, `q` cancels. Picking a device that did **not**
+answer as a host no longer loops: the tool reports why (e.g. `HTTP 401` from a
+foreign service on that port) and offers to try it anyway. The chosen host is
+kept for the current session only. When Tailscale is not running the tool offers
+to log in instead of failing. `--discover-towers` lists only the actual hosts.
+If the configured default host (see `config.json`) is online but another service
+already answers on the port, the tool says so and suggests a free port; if the
+host simply is not running, it prints the exact `--serve` command to start it.
+Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
 `--tower-name` and never prompt.
 
 `--serve` prints the tailnet IP the host is reachable at, e.g.
@@ -295,13 +309,15 @@ Optional settings that are read automatically on every run:
 |---|---|
 | `tailscale_socket` | socket path of a root-less `tailscaled` daemon |
 | `tower_name` | default tailnet hostname of the host (e.g. `jannistower`) |
+| `port` | default host port (set it once if 8443 is taken by another service) |
 
 Example:
 
 ```json
 {
   "tailscale_socket": "/run/user/1000/tailscaled.sock",
-  "tower_name": "jannistower"
+  "tower_name": "jannistower",
+  "port": 9443
 }
 ```
 
@@ -334,7 +350,7 @@ and **verifies the M2/M4 MIC**, i.e. proves the handshake is complete and usable
 
 `--download-captures` fetches the public example captures from
 [`vanhoefm/wifi-example-captures`](https://github.com/vanhoefm/wifi-example-captures)
-into `./test-captures` (or a directory you pass). When those files are present,
+into `./examples` (or a directory you pass). When those files are present,
 `--self-test` additionally verifies the documented WPA2 example, so the crypto
 path is covered by a real capture. Use `--captures-repo owner/repo` to point at a
 different repository of `.pcap`/`.pcapng` files.
@@ -356,6 +372,11 @@ https://0.0.0.0:8443 listening
 ```
 A self-signed certificate is created automatically on first start
 (`~/.wifi-handshake/tower-cert.pem` / `tower-key.pem`).
+
+If `--serve` reports that the port is **already in use**, another program (not
+this host) owns it. Pick a free port, e.g. `--serve --port 9443`, and connect
+the client with the same `--port`. The device list marks such a collision as
+`! HTTP 401` (or another status) instead of `(no host)`.
 
 ### Step 2 – Capture a handshake (Laptop)
 Via menu item **1 – Capture handshake** (or `--run-capture`):
@@ -477,7 +498,9 @@ environment variable).
     ├── hashcat.log                  # full hashcat status log
     └── cracked.txt                  # plaintext, if found
 ```
-Additionally the hashcat program copy lives under `<project>\tools\`.
+Additionally the hashcat program copy lives under `<project>\tools\`. Inside the
+project folder, new captures are written to `captures/` (override with
+`--output-dir`) and the committed example capture lives in `examples/`.
 
 **Nothing is deleted automatically** (everything stays for traceability).
 
@@ -510,6 +533,7 @@ Additionally the hashcat program copy lives under `<project>\tools\`.
 | Upload always fails / "connection reset" | old hosts crash the upload handler when started without `--max-upload-mb` (it defaulted to `None`). Restart the host with this build; the limit now defaults to 64 MiB. |
 | hashcat does not start (`is not a valid Win32 application`) | only a `.cmd` shim was found; use the project copy under `tools\`. |
 | "No host set" | set the host URL with `--tower URL` or enter it in menu item 3. |
+| Device list shows `! HTTP 401` (or another status) instead of a host | another service already listens on that port on the host. Start the host on a free port (`--serve --port 9443`) and connect with the same `--port`. |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
 
 ---
@@ -575,7 +599,7 @@ Start (menu):
   python wifi-handshake.py --self-test       # engine tests, no radio
   python wifi-handshake.py --inspect cap.pcapng   # find a handshake offline
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW
-  python wifi-handshake.py --download-captures    # example captures -> ./test-captures
+  python wifi-handshake.py --download-captures    # example captures -> ./examples
 
 Capture flow (menu item 1):
   choose adapter -> confirm YES -> scan -> pick a network

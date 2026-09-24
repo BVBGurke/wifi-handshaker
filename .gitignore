@@ -28,8 +28,8 @@ captures/
 # Exception: the small synthetic WPA2-PSK test capture is committed so the
 # built-in converter + MIC crypto can be verified by --self-test and CI.
 # (kept above the wordlist section strictly for fixtures)
-!test-captures/
-!test-captures/*
+!examples/
+!examples/*
 
 # Wordlists and rules (large / user-supplied)
 wordlists/

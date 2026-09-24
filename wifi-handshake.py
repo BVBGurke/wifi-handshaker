@@ -41,6 +41,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import random
 import re
 import selectors
 import shutil
@@ -438,6 +439,15 @@ def choose_tailscale_tower(args):
 
 
 TOWER_PROBE_TIMEOUT = 2.0
+# Connect and I/O budgets are deliberately separate: probes must give up
+# quickly on dead hosts (connect timeout) while leaving headroom for a TLS
+# handshake and response over a laggy tailnet link (I/O timeout).
+PROBE_IO_TIMEOUT = 6.0
+# Hard caps: a peer that claims a giant frame/body/header must never make us
+# buffer unbounded memory (see ws_read, _request_once, read_http_headers).
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_WS_FRAME_BYTES = 2 * 1024 * 1024
+MAX_HEADER_BYTES = 64 * 1024
 
 
 def ping_latency(host, timeout=TOWER_PROBE_TIMEOUT):
@@ -468,6 +478,12 @@ def ping_latency(host, timeout=TOWER_PROBE_TIMEOUT):
     return float(match.group(1)) if match else None
 
 
+# A working proxy never changes during a run; probing it on every connection
+# would add a wasted round trip to each fallback. A failed probe is re-checked
+# each time so a proxy that comes up later is still picked up.
+_PROXY_CACHE = {"host": None, "valid": False}
+
+
 def tailscale_proxy():
     """Return ``(host, port)`` of a SOCKS5 proxy for the tailnet, or None.
 
@@ -476,6 +492,8 @@ def tailscale_proxy():
     proxy is found via ``WIFI_HANDSHAKE_TAILSCALE_PROXY=socks5://host:port``
     or the tailscaled default ``127.0.0.1:1056``.
     """
+    if _PROXY_CACHE["valid"]:
+        return _PROXY_CACHE["host"]
     host, port = "127.0.0.1", 1056
     env = os.environ.get("WIFI_HANDSHAKE_TAILSCALE_PROXY")
     if env:
@@ -488,9 +506,11 @@ def tailscale_proxy():
     try:
         sock = socket.create_connection((host, port), timeout=0.4)
         sock.close()
-        return host, port
     except OSError:
         return None
+    _PROXY_CACHE["host"] = (host, port)
+    _PROXY_CACHE["valid"] = True
+    return host, port
 
 
 def _socks5_recv_exact(sock, size):
@@ -533,11 +553,12 @@ def _socks5_connect(proxy, host, port, timeout):
     sock.settimeout(timeout)
     try:
         sock.sendall(b"\x05\x01\x00")  # SOCKS5, one method: no authentication
-        if _socks5_recv_exact(sock, 2) != b"\x05\x00":
+        greeting = _socks5_recv_exact(sock, 2)
+        if len(greeting) != 2 or greeting[0] != 0x05 or greeting[1] != 0x00:
             raise OSError("SOCKS5 proxy rejected no-auth.")
         sock.sendall(b"\x05\x01\x00" + _socks5_address(host) + struct.pack(">H", port))
         header = _socks5_recv_exact(sock, 4)
-        if header[1] != 0:
+        if len(header) != 4 or header[0] != 0x05 or header[1] != 0:
             raise OSError("SOCKS5 connect failed.")
         if header[3] == 1:
             _socks5_recv_exact(sock, 6)
@@ -616,13 +637,28 @@ def connect_latency(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
         return None
 
 
-def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
+def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=None):
     """Return ``(scheme, health)`` if a tower answers at host:port, else None.
 
     Tries HTTPS first (the tower uses a self-signed certificate, so peer
     verification is disabled for the probe) and then plain HTTP. Only a valid
     health payload counts as a tower, so unrelated services are ignored.
+
+    When ``detail`` (a dict) is passed it receives a short ``error`` string (and
+    ``status`` when an HTTP reply arrived) explaining why nothing was found, so
+    callers can tell "nothing listens here" apart from "another service already
+    occupies this port" — the situation that made a running host look missing.
     """
+    def note(message, status=None):
+        if detail is None:
+            return
+        if status is not None:
+            # An HTTP reply is the most concrete evidence; keep it.
+            detail["error"] = message
+            detail["status"] = status
+        elif not detail.get("error"):
+            detail["error"] = message
+
     for scheme in ("https", "http"):
         conn = None
         try:
@@ -636,19 +672,37 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
             # Route through the tailnet SOCKS5 proxy when direct fails
             # (userspace Tailscale mode). http.client calls this hook with
             # ``(address, timeout, source_address)``; ignore its arguments and
-            # connect through open_socket instead.
+            # connect through open_socket instead. The TCP connect is bounded
+            # by the probe timeout, but the TLS handshake and response get more
+            # room: several round trips over a slow tailnet link can exceed it.
             def _make_connection(address, connect_timeout=None, source_address=None, **kwargs):
-                return open_socket(host, port, connect_timeout or timeout)[0]
+                sock = open_socket(host, port, connect_timeout or timeout)[0]
+                sock.settimeout(PROBE_IO_TIMEOUT)
+                return sock
             conn._create_connection = _make_connection
             conn.request("GET", "/api/v1/health")
             response = conn.getresponse()
-            data = response.read()
+            data = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                note("oversized reply", response.status)
+                continue
             if response.status == 200:
-                payload = json.loads(data.decode())
+                payload = json.loads(data.decode(errors="replace"))
                 if isinstance(payload, dict) and payload.get("ok") is True:
+                    if detail is not None and payload.get("protocol") != PROTOCOL_VERSION:
+                        # Different protocol version: still a host, but worth
+                        # surfacing so an outdated client can be recognized.
+                        detail["protocol"] = payload.get("protocol")
                     return scheme, payload
-        except (OSError, ssl.SSLError, http.client.HTTPException, ValueError):
-            pass
+                note("not a host (unexpected health reply)", response.status)
+            else:
+                note(f"HTTP {response.status}", response.status)
+        except ssl.SSLError:
+            note("TLS handshake failed")
+        except (OSError, http.client.HTTPException):
+            note("no answer")
+        except ValueError:
+            note("invalid reply")
         finally:
             if conn is not None:
                 try:
@@ -687,11 +741,15 @@ def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIM
             # ICMP is unavailable (userspace mode, firewalled peer): fall
             # back to the TCP connect time through the direct/SOCKS5 path.
             entry["latency"] = connect_latency(host, port, timeout)
-        found = probe_tower(host, port, timeout) if host else None
+        detail = {}
+        found = probe_tower(host, port, timeout, detail) if host else None
         entry["tower"] = found is not None
+        entry["probe_port"] = port
         if found:
             entry["scheme"], entry["health"] = found
             entry["url"] = f"{found[0]}://{host}:{port}"
+        else:
+            entry["probe_error"] = detail.get("error")
         return entry
 
     if entries:
@@ -713,12 +771,22 @@ def scan_tailnet_devices(port=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIM
     return entries
 
 
+def port_answered(reason):
+    """True when a probe reason means something answered on the port.
+
+    Distinguishes "another service occupies the port" (an HTTP/TLS reply) from
+    "nothing listens here" (no answer), so the UI can give the right advice.
+    """
+    return bool(reason) and reason.startswith(("HTTP", "TLS", "not a host"))
+
+
 def print_tailnet_devices(devices):
     if not devices:
         info("No reachable devices in the tailnet.")
         return
     print(style(f"  {'#':>3}  {'Host':<24} {'IP':<16} {'Ping':>7}  "
                 f"{'Backend':<9} Hashcat", "bold"))
+    busy = []
     for index, device in enumerate(devices, 1):
         name = device["hostname"][:23]
         if device.get("self"):
@@ -729,10 +797,22 @@ def print_tailnet_devices(devices):
             backend = str(health.get("backend") or "auto")[:8]
             hashcat = str(health.get("hashcat_version") or "-")[:12]
         else:
-            backend, hashcat = "(no host)", "-"
+            backend = "(no host)"
+            reason = device.get("probe_error")
+            if reason:
+                # Surface the probe result so a port collision is not mistaken
+                # for a dead host.
+                hashcat = ("! " + reason)[:12]
+                if port_answered(reason):
+                    busy.append((device["hostname"], device.get("probe_port"), reason))
+            else:
+                hashcat = "-"
         print(f"  {index:>3}  {name:<24} {device['ip']:<16} {ping:>7}  "
               f"{backend:<9} {hashcat}")
     info("* marks this device.")
+    for hostname, port, reason in busy:
+        info(f"{hostname}: port {port} replies with {reason} — another service "
+             f"already uses it; start the host on a free port.")
 
 
 def warn_host_unavailable(devices, port=DEFAULT_PORT):
@@ -746,7 +826,18 @@ def warn_host_unavailable(devices, port=DEFAULT_PORT):
         return
     want = name.rstrip(".").lower()
     hits = [d for d in devices if d["hostname"].lower() == want]
-    if hits and not any(d.get("tower") for d in hits):
+    if not hits or any(d.get("tower") for d in hits):
+        return
+    reason = next((d.get("probe_error") for d in hits if d.get("probe_error")), None)
+    if port_answered(reason):
+        # Something already answers there, so `--serve` cannot simply take the
+        # port. Point at a free port instead of telling the user to start a host
+        # that would silently share (Windows) or crash (Linux).
+        warn(f"Configured host '{name}' is online, but port {port} already answers "
+             f"with '{reason}' — another service uses it. Start the host on a free "
+             f"port there, e.g. python wifi-handshake.py --serve --port 9443, and "
+             f"connect with the same --port here.")
+    else:
         warn(f"Configured host '{name}' is online but does not answer on the host "
              f"service (port {port}). Start it there with: python wifi-handshake.py "
              f"--serve --port {port}")
@@ -768,12 +859,33 @@ def print_tailnet_towers(towers):
         print(f"  {index:>3}  {tower['hostname'][:23]:<24} {str(backend)[:11]:<12} {tower['url']}")
 
 
+def _use_device_anyway(device, port):
+    """Ask whether to use a device that did not answer the host probe.
+
+    A device can be online while the probe fails because the host is not
+    running yet, another service occupies the port, or the client simply could
+    not reach it. Rather than looping forever on "does not run a host", let the
+    user point at the URL anyway and let the real connection decide.
+    """
+    host = device.get("ip") or device.get("dns_name")
+    if not host:
+        return None
+    reason = device.get("probe_error") or "no host service answered"
+    warn(f"{device['hostname']} did not answer as a host on port {port} ({reason}).")
+    if input(f"Try {device['hostname']} at https://{host}:{port} anyway? [y/N] "
+             ).strip().lower() not in ("y", "yes"):
+        return None
+    return f"https://{host}:{port}"
+
+
 def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
     """Interactive device picker: scan the tailnet, list devices, connect.
 
-    Lists every reachable device (towers marked), supports a name/IP filter,
-    ``r`` to rescan and ``q`` to cancel, and only offers a manual URL when no
-    tower was found. The chosen tower is kept for this session only.
+    Lists every reachable device (hosts marked), supports a name/IP filter,
+    ``r`` to rescan, ``m`` for a manual URL, ``p`` to change the port and ``q``
+    to cancel. Picking a device that did not answer as a host offers to use it
+    anyway instead of silently looping. The chosen host is kept for this
+    session only.
     """
     port = port or getattr(args, "port", DEFAULT_PORT)
     status = tailscale_status()
@@ -792,19 +904,25 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
                  or query in (device["ip"] or "")]
         print_tailnet_devices(shown)
         if not devices:
-            answer = input("[r]escan, [m]anual URL, [q]uit: ").strip().lower()
+            answer = input("[r]escan, [m]anual URL, [p]ort, [q]uit: ").strip().lower()
             if answer == "r":
                 devices = scan_tailnet_devices(port, status, timeout)
                 continue
             if answer == "m":
                 args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
                 return args.tower
+            if answer == "p":
+                port = _ask_port(port, args)
+                devices = scan_tailnet_devices(port, status, timeout)
+                warn_host_unavailable(devices, port)
+                continue
             return None
         has_tower = any(device.get("tower") for device in shown)
         if not has_tower:
-            info("None of these devices runs a host.")
-        extra = "" if has_tower else ", m=manual URL"
-        info(f"Number to pick, text to filter, r=rescan{extra}, q=cancel.")
+            info(f"No device answered as a host on port {port}. A device can be online "
+                 f"without running the host, or another service may occupy the port.")
+        info(f"Number to pick, text to filter, r=rescan, m=manual URL, "
+             f"p=change port ({port}), q=cancel.")
         answer = input("Device: ").strip()
         low = answer.lower()
         if low in ("q", ""):
@@ -813,13 +931,23 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
             devices = scan_tailnet_devices(port, status, timeout)
             query = None
             continue
-        if low == "m" and not has_tower:
+        if low == "m":
             args.tower = input("Host URL (e.g. https://100.x.y.z:8443): ").strip() or None
             return args.tower
+        if low == "p":
+            port = _ask_port(port, args)
+            devices = scan_tailnet_devices(port, status, timeout)
+            warn_host_unavailable(devices, port)
+            query = None
+            continue
         if answer.isdecimal() and 1 <= int(answer) <= len(shown):
             device = shown[int(answer) - 1]
             if not device.get("tower"):
-                warn(f"{device['hostname']} does not run a host.")
+                chosen = _use_device_anyway(device, port)
+                if chosen:
+                    args.tower = chosen
+                    ok("Host set to " + args.tower)
+                    return args.tower
                 continue
             if input(f"Connect to {device['hostname']} at {device['url']}? [Y/n] "
                      ).strip().lower() in ("n", "no"):
@@ -831,6 +959,17 @@ def choose_tailnet_device(args, port=None, timeout=TOWER_PROBE_TIMEOUT):
         if not shown:
             warn(f"No device matches '{answer}'.")
             query = None
+
+
+def _ask_port(current, args):
+    """Prompt for a host port and remember it for this session."""
+    raw = input(f"Host port [{current}]: ").strip()
+    if raw.isdecimal() and 0 < int(raw) < 65536:
+        args.port = int(raw)
+        return int(raw)
+    if raw:
+        warn("Enter a port between 1 and 65535.")
+    return current
 
 
 def resolve_tower(args, name=None):
@@ -846,7 +985,8 @@ def resolve_tower(args, name=None):
         return None
     wanted = (name or getattr(args, "tower_name", None)
               or load_config().get("tower_name") or "tower")
-    url = tailscale_tower_url(wanted, getattr(args, "port", DEFAULT_PORT))
+    port = getattr(args, "port", None) or DEFAULT_PORT
+    url = tailscale_tower_url(wanted, port)
     if url:
         ok(f"Found tailnet peer '{wanted}': {url}")
         args.tower = url
@@ -1925,7 +2065,8 @@ def inspect_capture(path, ssid=None, password=None):
 EXAMPLE_CAPTURES_REPO = "vanhoefm/wifi-example-captures"
 # file name -> (SSID, passphrase) for captures whose secret is documented.
 KNOWN_EXAMPLE_PASSWORDS = {
-    "wnm_sleep_test-wpa2-psk:12345678.pcapng": ("test-wnm-rsn", "12345678"),
+    # No colon in the name: Windows/NTFS cannot check out a file with ':'.
+    "wnm_sleep_test-wpa2-psk-12345678.pcapng": ("test-wnm-rsn", "12345678"),
 }
 
 
@@ -2009,7 +2150,8 @@ def load_config():
     """Read ``~/.wifi-handshake/config.json`` into a dict (empty if absent).
 
     Supported keys: ``tailscale_socket`` (path to a root-less tailscaled
-    socket) and ``tower_name`` (default tailnet host of the tower).
+    socket), ``tower_name`` (default tailnet host of the tower) and ``port``
+    (default host port, useful when 8443 is taken by another service).
     """
     path = app_dir() / "config.json"
     if not path.is_file():
@@ -2019,6 +2161,14 @@ def load_config():
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def default_port():
+    """Host port from ``config.json`` (key ``port``), else :data:`DEFAULT_PORT`."""
+    try:
+        return int(load_config().get("port"))
+    except (TypeError, ValueError):
+        return DEFAULT_PORT
 
 
 def default_tools_dir():
@@ -2577,17 +2727,17 @@ def ws_frame(payload, opcode=0x1, mask=False):
     payload = payload if isinstance(payload, bytes) else payload.encode()
     header = bytearray([0x80 | opcode])
     length = len(payload)
+    mask_bit = 0x80 if mask else 0
     if length < 126:
-        header.append(length)
+        header.append(mask_bit | length)
     elif length < 65536:
-        header.append(126)
+        header.append(mask_bit | 126)
         header += struct.pack("!H", length)
     else:
-        header.append(127)
+        header.append(mask_bit | 127)
         header += struct.pack("!Q", length)
     if not mask:
         return bytes(header) + payload
-    header[1] |= 0x80
     key = os.urandom(4)
     masked = bytes(byte ^ key[index % 4] for index, byte in enumerate(payload))
     return bytes(header) + key + masked
@@ -2619,6 +2769,10 @@ def ws_read(sock, timeout):
             length = struct.unpack("!H", recv_exact(sock, 2))[0]
         elif length == 127:
             length = struct.unpack("!Q", recv_exact(sock, 8))[0]
+        if length > MAX_WS_FRAME_BYTES:
+            # A peer claiming a giant frame gets dropped instead of making us
+            # buffer unbounded memory while recv_exact spins until timeout.
+            return "error", b""
         mask = recv_exact(sock, 4) if masked else None
         payload = recv_exact(sock, length) if length else b""
     except (socket.timeout, ConnectionError, OSError):
@@ -2629,9 +2783,16 @@ def ws_read(sock, timeout):
 
 
 def read_http_headers(sock):
+    """Read HTTP headers up to CRLFCRLF, capped, in chunks.
+
+    The old one-byte-at-a-time recv() made the WebSocket upgrade cost one
+    round trip per byte of header — many seconds on a 200ms tailnet link.
+    """
     data = bytearray()
     while b"\r\n\r\n" not in data:
-        chunk = sock.recv(1)
+        if len(data) > MAX_HEADER_BYTES:
+            break
+        chunk = sock.recv(4096)
         if not chunk:
             break
         data += chunk
@@ -2840,12 +3001,27 @@ class TowerWorker(threading.Thread):
 
 class TowerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # SO_REUSEADDR lets a second socket share an already-bound port on Windows,
+    # so `--serve` would report success while another service keeps receiving
+    # every connection. Only reuse on POSIX (where it just eases TIME_WAIT
+    # restarts), so a real port collision fails loudly instead of silently.
+    allow_reuse_address = os.name != "nt"
 
 
 class TowerHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "wifi-handshake-tower"
+
+    def setup(self):
+        # A peer that connects and reads/writes nothing (slow-loris style) must
+        # not hold a worker thread and a descriptor forever. Uploads and plain
+        # requests get 30s per socket operation; the WebSocket stream then
+        # manages its own tighter timeouts.
+        super().setup()
+        try:
+            self.connection.settimeout(30)
+        except OSError:
+            pass
 
     def log_message(self, fmt, *args):
         print(f"[host] {self.address_string()} {fmt % args}", flush=True)
@@ -2959,6 +3135,9 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
                 job = self.store.get(job_id)
                 if job is None:
                     break
+                # sendall must never block on a client that stopped reading;
+                # 5s is generous for a ~1KB status frame.
+                sock.settimeout(5.0)
                 sock.sendall(ws_frame(json.dumps({"type": "status", "job": job})))
                 if job["state"] in ("done", "failed", "cancelled"):
                     break
@@ -2966,8 +3145,9 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
                 if op in ("close", "error"):
                     break
                 if op == "ping":
+                    sock.settimeout(5.0)
                     sock.sendall(ws_frame(b"", opcode=0xA))
-        except OSError:
+        except (OSError, socket.timeout):
             pass
 
 
@@ -2996,7 +3176,15 @@ def serve(args):
     store = JobStore(config.jobs_dir)
     worker = TowerWorker(store, config, tools)
     worker.start()
-    server = TowerServer((config.host, config.port), TowerHandler)
+    try:
+        server = TowerServer((config.host, config.port), TowerHandler)
+    except OSError as exc:
+        worker.stop()
+        raise RuntimeError(
+            f"Could not listen on {config.host}:{config.port}: {clean(str(exc))}. "
+            f"Another service already uses this port. Start the host on a free port, "
+            f"e.g. python wifi-handshake.py --serve --port 9443, and connect the "
+            f"client with the same --port.") from exc
     server.store, server.config, server.tools = store, config, tools
     server.upload_semaphore = threading.BoundedSemaphore(4)
     context = ensure_server_context(config)
@@ -3050,7 +3238,10 @@ def remember_fingerprint(host, port, fingerprint):
         except (OSError, ValueError):
             data = {}
     data[host_key(host, port)] = fingerprint
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Atomic replace so a crash mid-write cannot corrupt known_hosts.json.
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 class TowerClient:
@@ -3059,7 +3250,10 @@ class TowerClient:
         parsed = urllib.parse.urlsplit(url if "://" in url else "https://" + url)
         self.scheme = parsed.scheme or "https"
         self.host = parsed.hostname or "localhost"
-        self.port = parsed.port or (443 if self.scheme == "https" else 80)
+        # A bare URL without a port uses the tool's own default (8443), not
+        # the protocol default: https://host silently hitting :443 would be a
+        # surprise for everyone running --serve on the default port.
+        self.port = parsed.port or DEFAULT_PORT
         self.timeout = timeout
         self.connect_timeout = connect_timeout
         self.fingerprint = fingerprint
@@ -3139,10 +3333,17 @@ class TowerClient:
                 self._verify_peer(conn.sock)
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
-            data = response.read()
+            data = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(data) > MAX_RESPONSE_BYTES:
+                raise RuntimeError(f"Host {self.base()} sent an oversized reply.")
             if response.status >= 400:
                 raise RuntimeError(f"Host error {response.status}: {clean(data.decode(errors='replace')[:400])}")
-            return json.loads(data.decode()) if data else {}
+            try:
+                return json.loads(data.decode(errors="replace")) if data else {}
+            except ValueError as exc:
+                # A truncated/corrupt body becomes a hard error instead of
+                # crashing callers with a JSON traceback.
+                raise RuntimeError(f"Host {self.base()} returned invalid JSON: {clean(str(exc))}") from exc
         finally:
             conn.close()
 
@@ -3159,7 +3360,9 @@ class TowerClient:
             except (OSError, http.client.HTTPException) as exc:
                 last_error = exc
                 if attempt < retries:
-                    time.sleep(min(0.5 * (2 ** attempt), 3.0))
+                    # Exponential backoff plus jitter so several clients that
+                    # reconnect at once do not all retry in lockstep.
+                    time.sleep(min(0.5 * (2 ** attempt), 3.0) + random.uniform(0, 0.25))
         raise RuntimeError(f"Host {self.base()} unreachable: {clean(str(last_error))}")
 
     def health(self):
@@ -3287,6 +3490,27 @@ def status_line(job):
     return json.dumps([job.get("state"), job.get("progress"), job.get("hash_rate")])
 
 
+def _fetch_job_with_retry(client, job_id, attempts=5):
+    """Fetch a job, retrying transient failures with capped jittered backoff.
+
+    The host may be mid-restart or the tailnet link may drop for a few
+    seconds; a short bounded retry keeps the watcher alive across such blips
+    instead of giving up on the first hiccup.
+    """
+    delay = 2.0
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return client.job(job_id)
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(min(delay, 30.0) + random.uniform(0, 0.5))
+            delay *= 2
+    raise RuntimeError(str(last_error)) if last_error else RuntimeError("job status was lost")
+
+
 def report_job_result(job):
     if job.get("state") == "failed":
         print(f"hashcat error: {job.get('error')}")
@@ -3315,11 +3539,11 @@ def watch_job(client, job_id, tower_url):
         print(f"Connection to the host was lost: {exc}")
         print("The job keeps running on the host. Reattach later with "
               f"--tower {tower_url} --watch {job_id}")
-        return 0
+        return 1
 
     client.stream_events(job_id, on_status)
     try:
-        job = client.job(job_id)
+        job = _fetch_job_with_retry(client, job_id)
     except RuntimeError as exc:
         return lost(exc)
     deadline = time.monotonic() + 1800
@@ -3333,8 +3557,14 @@ def watch_job(client, job_id, tower_url):
         time.sleep(3)
         try:
             job = client.job(job_id)
-        except RuntimeError as exc:
-            return lost(exc)
+        except RuntimeError:
+            # Transient drop: reconnect with backoff, re-attach the stream and
+            # keep watching; only give up when the host stays unreachable.
+            try:
+                job = _fetch_job_with_retry(client, job_id)
+                client.stream_events(job_id, on_status)
+            except RuntimeError as exc:
+                return lost(exc)
     if job.get("state") not in ("done", "failed", "cancelled"):
         print(f"Still running. Reattach with: --tower {tower_url} --watch {job_id}")
         return 1
@@ -3852,6 +4082,53 @@ def self_test():
         globals()["open_socket"] = _real_open
         _httpd.shutdown()
         _tiny.listener.close()
+    # Host probe diagnostics: a dead port reports "no answer", while an HTTP
+    # reply is surfaced as a status. This is what tells a missing host apart
+    # from a port that another service already occupies.
+    detail = {}
+    assert probe_tower("127.0.0.1", 9, timeout=0.5, detail=detail) is None
+    assert detail.get("error") == "no answer", detail
+    busy = [{"hostname": "tower", "ip": "127.0.0.1", "online": True, "self": False,
+             "latency": 1.0, "tower": False, "probe_port": 9, "probe_error": "HTTP 401"}]
+    with contextlib.redirect_stdout(io.StringIO()) as probe_out:
+        print_tailnet_devices(busy)
+    assert "another service" in probe_out.getvalue()
+    # Picking a device that is not a host offers to use it anyway instead of
+    # looping; answering "no" returns to the picker.
+    import builtins
+    _real_input = builtins.input
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            builtins.input = lambda *a, **k: "y"
+            assert _use_device_anyway({"hostname": "t", "ip": "1.2.3.4"},
+                                      8443) == "https://1.2.3.4:8443"
+            builtins.input = lambda *a, **k: "n"
+            assert _use_device_anyway({"hostname": "t", "ip": "1.2.3.4",
+                                       "probe_error": "HTTP 401"}, 8443) is None
+        # The picker must not loop when a device is not a host: answering the
+        # number and then "y" sets the host and returns to the caller.
+        _real_status = globals()["tailscale_status"]
+        _real_ready = globals()["tailscale_ready"]
+        _real_scan = globals()["scan_tailnet_devices"]
+        _answers = iter(["1", "y"])
+        try:
+            globals()["tailscale_status"] = lambda *a, **k: {"state": "Running"}
+            globals()["tailscale_ready"] = lambda *a, **k: True
+            globals()["scan_tailnet_devices"] = lambda *a, **k: [
+                {"hostname": "tower", "ip": "1.2.3.4", "dns_name": "", "latency": 1.0,
+                 "tower": False, "probe_error": "HTTP 401", "probe_port": 8443,
+                 "self": False}]
+            builtins.input = lambda *a, **k: next(_answers)
+            picker_args = argparse.Namespace(port=8443)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                assert choose_tailnet_device(picker_args) == "https://1.2.3.4:8443"
+            assert picker_args.tower == "https://1.2.3.4:8443"
+        finally:
+            globals()["tailscale_status"] = _real_status
+            globals()["tailscale_ready"] = _real_ready
+            globals()["scan_tailnet_devices"] = _real_scan
+    finally:
+        builtins.input = _real_input
     # Tower: GPU backend selection.
     assert preferred_backend({"cuda": [{"id": 1, "name": "NVIDIA GeForce RTX 4070 SUPER"}],
                               "opencl": [{"id": 2, "type": "GPU", "name": "NVIDIA GeForce RTX 4070 SUPER"}]}) == "cuda"
@@ -3921,8 +4198,8 @@ def self_test():
         local_args = build_parser().parse_args(["--local-capture", "x.pcapng"])
         assert local_args.local_capture == Path("x.pcapng")
     # Built-in pcap -> hc22000 converter must work without tshark/hcxtools.
-    example = Path(__file__).resolve().parent / "test-captures" / \
-        "wnm_sleep_test-wpa2-psk:12345678.pcapng"
+    example = Path(__file__).resolve().parent / "examples" / \
+        "wnm_sleep_test-wpa2-psk-12345678.pcapng"
     if example.is_file():
         lines = extract_hc22000(example)
         assert lines, "built-in converter found no handshake in the example capture"
@@ -3986,7 +4263,7 @@ def self_test():
         assert test_rows(decoded_again.splitlines())
     # Optional real-world regression: run against a downloaded example capture
     # (see --download-captures). Skipped silently when the file is absent.
-    example_dir = Path(__file__).resolve().parent / "test-captures"
+    example_dir = Path(__file__).resolve().parent / "examples"
     for name, (essid, password) in KNOWN_EXAMPLE_PASSWORDS.items():
         example = example_dir / name
         if not example.is_file():
@@ -4174,7 +4451,7 @@ def run_interactive(args):
             inspect_capture(Path(cap), essid, password)
             continue
         if choice == "6":
-            target = input("Target directory [test-captures]: ").strip() or "test-captures"
+            target = input("Target directory [examples]: ").strip() or "examples"
             download_example_captures(Path(target), args.captures_repo)
             continue
         if choice == "7":
@@ -4235,10 +4512,12 @@ No deauthentication, injection or radio interference anywhere in this tool.
 Only test networks you own or have permission to test.
 """)
     parser.add_argument("--tower", help="host base URL, e.g. https://tower:8443")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"host port, default {DEFAULT_PORT}")
+    parser.add_argument("--port", type=int,
+                        help=f"host port (default: config.json 'port', else {DEFAULT_PORT})")
     parser.add_argument("--bind", default="0.0.0.0", help="server bind address, default 0.0.0.0")
     parser.add_argument("--tools-dir", type=Path, help="folder holding hashcat")
-    parser.add_argument("--output-dir", type=Path, help="where captures are saved")
+    parser.add_argument("--output-dir", type=Path,
+                        help="where captures are saved (default: ./captures)")
     parser.add_argument("--insecure", action="store_true", help="skip certificate pinning")
     parser.add_argument("--serve", action="store_true", help="start the host server (alternative to menu choice 2)")
     parser.add_argument("--install-tools", action="store_true", help="download, verify and unpack hashcat")
@@ -4272,9 +4551,9 @@ Only test networks you own or have permission to test.
                          help="analyse an existing .pcap/.pcapng and find handshakes")
     offline.add_argument("--essid", help="SSID for --inspect MIC verification")
     offline.add_argument("--password", help="passphrase for --inspect MIC verification")
-    offline.add_argument("--download-captures", nargs="?", const=Path("test-captures"),
+    offline.add_argument("--download-captures", nargs="?", const=Path("examples"),
                          type=Path, help="download example captures into DIR "
-                                         "(default: ./test-captures)")
+                                         "(default: ./examples)")
     offline.add_argument("--captures-repo", default=EXAMPLE_CAPTURES_REPO,
                          help="GitHub owner/repo to download captures from "
                               f"(default: {EXAMPLE_CAPTURES_REPO})")
@@ -4319,6 +4598,10 @@ def run_capture_cli(args):
         raise RuntimeError("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
     if not sys.stdin.isatty():
         raise RuntimeError("Run in an interactive terminal for sudo and the menus.")
+    # Create the output directory as the invoking user, before sudo re-execs,
+    # so captures land in ./captures/ and the directory is not left root-owned.
+    output_dir = (args.output_dir or (Path(__file__).resolve().parent / "captures")).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         # Ask for the sudo password once, then re-exec as root. The cached
         # authentication means sudo does not prompt a second time, so the
@@ -4346,9 +4629,6 @@ def run_capture_cli(args):
     fields = run("tshark", "-G", "fields").stdout
     if any("\t" + field + "\t" not in fields for field in FIELDS):
         raise RuntimeError("This tshark build is missing required Wi-Fi/EAPOL fields.")
-    output_dir = (args.output_dir or Path(__file__).resolve().parent).resolve()
-    if not output_dir.is_dir():
-        raise RuntimeError(f"Output directory does not exist: {output_dir}")
     available = adapters()
     if not available:
         raise RuntimeError("No wireless interfaces found.")
@@ -4501,6 +4781,8 @@ def run_headless(args):
 
 def main(argv=None):
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.port is None:
+        args.port = default_port()
     try:
         if args.self_test:
             self_test()
