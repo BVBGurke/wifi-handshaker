@@ -36,6 +36,7 @@ import hmac
 import http.client
 import http.server
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -312,8 +313,14 @@ def tailscale_peer(name, status=None):
     return None
 
 
-def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
-    """Build a tower URL from a tailnet peer's IP address, or None."""
+def tailscale_tower_endpoint(name="tower", port=DEFAULT_PORT):
+    """Return ``(host, scheme)`` for a tailnet peer, or ``None``.
+
+    The peer's tailnet IP is preferred; the scheme is detected with the health
+    handshake so a ``--no-tls`` host is reached over plain HTTP instead of
+    wrongly being forced to HTTPS. Falls back to ``https`` when the host does
+    not answer (the caller then produces the usual connection error).
+    """
     status = tailscale_status()
     if not tailscale_ready(status):
         return None
@@ -323,7 +330,17 @@ def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
     host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
-    return f"{scheme}://{host}:{port}"
+    found = probe_tower(host, port)
+    return host, (found[0] if found else "https")
+
+
+def tailscale_tower_url(name="tower", port=DEFAULT_PORT, scheme="https"):
+    """Build a tower URL from a tailnet peer's IP address, or None."""
+    endpoint = tailscale_tower_endpoint(name, port)
+    if not endpoint:
+        return None
+    host, detected = endpoint
+    return f"{detected or scheme}://{host}:{port}"
 
 
 def print_tailscale_status(status=None):
@@ -395,7 +412,10 @@ def choose_tailscale_tower(args):
     host = peer["ip"] or peer["dns_name"]
     if not host:
         return None
-    args.tower = f"https://{host}:{getattr(args, 'port', DEFAULT_PORT)}"
+    port = getattr(args, "port", DEFAULT_PORT)
+    found = probe_tower(host, port)
+    scheme = found[0] if found else "https"
+    args.tower = f"{scheme}://{host}:{port}"
     ok("Host URL set to " + args.tower)
     return args.tower
 
@@ -460,6 +480,28 @@ def _socks5_recv_exact(sock, size):
     return bytes(chunks)
 
 
+def _socks5_address(host):
+    """Encode a SOCKS5 target address (IPv4, IPv6 or domain name).
+
+    Literal addresses use ATYP 0x01/0x04; anything else is sent as a domain
+    (ATYP 0x03) so the *proxy* resolves it, matching ``socks5h`` semantics.
+    That is what makes MagicDNS names work in userspace Tailscale mode, where
+    the client itself has no tailnet route and cannot resolve them.
+    """
+    for family, atyp in ((socket.AF_INET, b"\x01"), (socket.AF_INET6, b"\x04")):
+        try:
+            return atyp + socket.inet_pton(family, host)
+        except OSError:
+            continue
+    try:
+        name = host.encode("idna")
+    except UnicodeError:
+        name = host.encode("utf-8")
+    if not 0 < len(name) <= 255:
+        raise OSError(f"Invalid SOCKS5 target host: {host!r}")
+    return b"\x03" + bytes([len(name)]) + name
+
+
 def _socks5_connect(proxy, host, port, timeout):
     """Connect ``host:port`` through a SOCKS5 proxy and return the socket."""
     proxy_host, proxy_port = proxy
@@ -469,11 +511,7 @@ def _socks5_connect(proxy, host, port, timeout):
         sock.sendall(b"\x05\x01\x00")  # SOCKS5, one method: no authentication
         if _socks5_recv_exact(sock, 2) != b"\x05\x00":
             raise OSError("SOCKS5 proxy rejected no-auth.")
-        if ":" in host:
-            address = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
-        else:
-            address = b"\x01" + socket.inet_aton(host)
-        sock.sendall(b"\x05\x01\x00" + address + struct.pack(">H", port))
+        sock.sendall(b"\x05\x01\x00" + _socks5_address(host) + struct.pack(">H", port))
         header = _socks5_recv_exact(sock, 4)
         if header[1] != 0:
             raise OSError("SOCKS5 connect failed.")
@@ -490,29 +528,49 @@ def _socks5_connect(proxy, host, port, timeout):
         raise
 
 
+TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def is_tailnet_address(host):
+    """True for CGNAT/Tailscale IPv4 and Tailscale IPv6 addresses."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address in TAILNET_V4 or address in TAILNET_V6
+
+
 def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
     """Return ``(connected_socket, connect_ms)``, trying direct then SOCKS5.
 
-    Direct connections are used when possible; when they fail and a tailnet
-    SOCKS5 proxy is available the connection is retried through it, which is
-    what makes userspace (root-less) Tailscale mode work.
+    A tailnet IP that is only reachable in userspace (root-less) mode has no
+    direct route, so for tailnet addresses the SOCKS5 proxy is tried *first*;
+    otherwise a direct connection is preferred and SOCKS5 is the fallback. All
+    failure reasons are kept so the error explains which path was attempted.
     """
-    last_error = None
-    try:
-        started = time.monotonic()
-        sock = socket.create_connection((host, port), timeout=timeout)
-        return sock, (time.monotonic() - started) * 1000.0
-    except OSError as exc:
-        last_error = exc
     proxy = tailscale_proxy()
-    if proxy:
+    if proxy and is_tailnet_address(host):
+        attempts = [("SOCKS5", proxy), ("direct", None)]
+    else:
+        attempts = [("direct", None)] + ([("SOCKS5", proxy)] if proxy else [])
+    errors = []
+    for kind, forward in attempts:
         try:
             started = time.monotonic()
-            sock = _socks5_connect(proxy, host, port, timeout)
+            if forward is None:
+                sock = socket.create_connection((host, port), timeout=timeout)
+            else:
+                sock = _socks5_connect(forward, host, port, timeout)
             return sock, (time.monotonic() - started) * 1000.0
         except OSError as exc:
-            last_error = exc
-    raise last_error if last_error else OSError("connection failed")
+            if forward is None:
+                errors.append(f"direct: {exc}")
+            else:
+                errors.append(f"SOCKS5 {forward[0]}:{forward[1]}: {exc}")
+    if not proxy:
+        errors.append("SOCKS5: no tailnet proxy detected")
+    raise OSError(f"cannot reach {host}:{port} ({'; '.join(errors)})")
 
 
 def connect_latency(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT):
@@ -1941,7 +1999,10 @@ def resolve_named(name, directories, suffixes):
     """Resolve a client-supplied wordlist/rule name against configured folders."""
     if not name or not isinstance(name, str):
         raise RuntimeError("Empty name in attack parameters.")
-    if "/" in name or "\\" in name or name.startswith(".") or ".." in name:
+    # Reject any path-like name, including Windows drive paths (``D:secret``)
+    # which would otherwise escape the configured folder on Windows.
+    if ("/" in name or "\\" in name or ":" in name or name.startswith(".")
+            or ".." in name or Path(name).is_absolute() or os.path.splitdrive(name)[0]):
         raise RuntimeError(f"Refusing suspicious name: {name}")
     for directory in directories:
         candidate = Path(directory) / name
@@ -2018,6 +2079,11 @@ def build_hashcat_command(hashcat, hash_file, attack, out_file, potfile, config,
         raise RuntimeError(f"Unknown attack type: {kind}")
     chosen = str(attack.get("backend") or backend or "").lower()
     if chosen not in BACKEND_IGNORE_FLAGS:
+        chosen = backend if backend in BACKEND_IGNORE_FLAGS else None
+    elif available_backends is not None and chosen not in available_backends:
+        # The client asked for a backend this host does not have. Ignoring
+        # every available backend would leave hashcat with no device, so fall
+        # back to the detected one instead of producing "No devices found".
         chosen = backend if backend in BACKEND_IGNORE_FLAGS else None
     command += backend_flags(chosen, available_backends)
     # Enforce the server's job runtime limit. hashcat --runtime stops the
@@ -2162,6 +2228,10 @@ class JobStore:
             return [dict(j) for j in sorted(self.jobs.values(),
                                             key=lambda item: item["created"], reverse=True)]
 
+    def queue_length(self):
+        with self.lock:
+            return len(self.queue)
+
     def take_next(self, timeout):
         with self.lock:
             if not self.queue:
@@ -2201,6 +2271,29 @@ def read_cracked(out_file):
     return lines[-1] if lines else None
 
 
+def signed_exit_code(code):
+    """Normalise a negative Windows exit code (e.g. 4294967295 -> -1)."""
+    if code is None:
+        return code
+    return code - 2 ** 32 if code > 2 ** 31 - 1 else code
+
+
+def hashcat_failure(log_file, limit=200):
+    """Return the most useful line from a hashcat log for an error message."""
+    try:
+        lines = [line.strip() for line in
+                 Path(log_file).read_text(encoding="utf-8", errors="replace").splitlines()]
+    except OSError:
+        return "see hashcat.log"
+    lines = [line for line in lines if line]
+    for line in reversed(lines):
+        lowered = line.lower()
+        if any(word in lowered for word in ("error", "fatal", "no hashes", "not found",
+                                            "no devices", "invalid")):
+            return line[:limit]
+    return lines[-1][:limit] if lines else "see hashcat.log"
+
+
 def is_capture_like(body):
     if len(body) < 4:
         return False
@@ -2219,7 +2312,8 @@ def ws_accept_key(key):
     return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
 
 
-def ws_frame(payload, opcode=0x1):
+def ws_frame(payload, opcode=0x1, mask=False):
+    """Build a WebSocket frame. Clients MUST mask (RFC 6455), servers must not."""
     payload = payload if isinstance(payload, bytes) else payload.encode()
     header = bytearray([0x80 | opcode])
     length = len(payload)
@@ -2231,7 +2325,12 @@ def ws_frame(payload, opcode=0x1):
     else:
         header.append(127)
         header += struct.pack("!Q", length)
-    return bytes(header) + payload
+    if not mask:
+        return bytes(header) + payload
+    header[1] |= 0x80
+    key = os.urandom(4)
+    masked = bytes(byte ^ key[index % 4] for index, byte in enumerate(payload))
+    return bytes(header) + key + masked
 
 
 def recv_exact(sock, count):
@@ -2309,13 +2408,24 @@ def generate_self_signed(cert_path, key_path, host):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "wifi-handshake-tower")])
     alt = [x509.DNSName("localhost")]
-    for candidate in {host, socket.gethostname()}:
+    candidates = {host, socket.gethostname()}
+    # Include the tailnet identity so the certificate also covers the address
+    # clients actually connect to (100.x.y.z / MagicDNS name), not just the
+    # bind address (usually 0.0.0.0, which is dropped below).
+    status = tailscale_status()
+    if status:
+        candidates.add(status.get("self_ip"))
+        candidates.add(status.get("self_dns_name"))
+    for candidate in candidates:
         if not candidate or candidate in ("0.0.0.0", "::"):
             continue
         try:
             alt.append(x509.IPAddress(ipaddress.ip_address(candidate)))
         except ValueError:
-            alt.append(x509.DNSName(candidate))
+            try:
+                alt.append(x509.DNSName(candidate))
+            except ValueError:
+                pass
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
@@ -2455,7 +2565,8 @@ class TowerWorker(threading.Thread):
             self.store.update(job_id, state="cancelled")
             return
         if proc.returncode not in (0, 1):
-            raise RuntimeError(f"hashcat exited with code {proc.returncode}. See hashcat.log.")
+            raise RuntimeError("hashcat failed: " + hashcat_failure(job_dir / "hashcat.log")
+                               + f" (exit code {signed_exit_code(proc.returncode)})")
         password = read_cracked(out_file)
         self.store.update(job_id, state="done", progress=100.0,
                           result={"found": password is not None, "password": password})
@@ -2501,7 +2612,7 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
                 "hcxpcapngtool": str(self.tools["hcxpcapngtool"]) if self.tools.get("hcxpcapngtool") else None,
                 "backend": self.tools.get("backend"),
                 "devices": backend_summary(self.tools.get("backends") or {}),
-                "queue": len(self.store.queue)}
+                "queue": self.store.queue_length()}
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
@@ -2545,7 +2656,16 @@ class TowerHandler(http.server.BaseHTTPRequestHandler):
         filename = Path(self.headers.get("X-Filename", "capture.bin")).name
         if filename in ("", ".", ".."):
             filename = "capture.bin"
-        body = self.rfile.read(length)
+        # Bound concurrent body reads so many parallel uploads cannot each hold
+        # up to max_upload_mb of memory and exhaust the host.
+        semaphore = getattr(self.server, "upload_semaphore", None)
+        if semaphore is not None and not semaphore.acquire(timeout=15):
+            return self.send_json(503, {"error": "too many concurrent uploads; retry shortly"})
+        try:
+            body = self.rfile.read(length)
+        finally:
+            if semaphore is not None:
+                semaphore.release()
         if not is_capture_like(body):
             return self.send_json(400, {"error": "body does not look like a capture"})
         job = self.store.create(attack, filename, body)
@@ -2612,6 +2732,7 @@ def serve(args):
     worker.start()
     server = TowerServer((config.host, config.port), TowerHandler)
     server.store, server.config, server.tools = store, config, tools
+    server.upload_semaphore = threading.BoundedSemaphore(4)
     context = ensure_server_context(config)
     if context:
         server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -2638,12 +2759,17 @@ def known_hosts_path():
     return app_dir() / "known_hosts.json"
 
 
+def host_key(host, port):
+    """Unambiguous ``host:port`` key (IPv6 hosts are bracketed)."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def known_fingerprint(host, port):
     path = known_hosts_path()
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8")).get(f"{host}:{port}")
+        return json.loads(path.read_text(encoding="utf-8")).get(host_key(host, port))
     except (OSError, ValueError):
         return None
 
@@ -2657,26 +2783,36 @@ def remember_fingerprint(host, port, fingerprint):
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-    data[f"{host}:{port}"] = fingerprint
+    data[host_key(host, port)] = fingerprint
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 class TowerClient:
-    def __init__(self, url, fingerprint=None, insecure=False, timeout=60, confirm=None):
+    def __init__(self, url, fingerprint=None, insecure=False, timeout=60,
+                 connect_timeout=10.0, confirm=None):
         parsed = urllib.parse.urlsplit(url if "://" in url else "https://" + url)
         self.scheme = parsed.scheme or "https"
         self.host = parsed.hostname or "localhost"
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.fingerprint = fingerprint
         self.insecure = insecure
-        self.confirm = confirm or (lambda digest: input(
-            f"Host certificate fingerprint (sha256): {digest}\n"
-            "Trust this host and remember it? Type YES: ").strip() == "YES")
+        self.confirm = confirm or self._confirm_fingerprint
         self.last_fingerprint = None
 
     def base(self):
         return f"{self.host}:{self.port}"
+
+    @staticmethod
+    def _confirm_fingerprint(digest):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise RuntimeError(
+                "Host certificate is not pinned yet and there is no terminal to "
+                "confirm it. Pass --fingerprint <sha256>, use --insecure, or run "
+                "interactively.")
+        return input(f"Host certificate fingerprint (sha256): {digest}\n"
+                     "Trust this host and remember it? Type YES: ").strip() == "YES"
 
     def _context(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -2701,23 +2837,42 @@ class TowerClient:
         if digest.lower() != expected:
             raise RuntimeError(f"Certificate fingerprint mismatch. Expected {expected}, got {digest}.")
 
+    def _create_connection(self, address=None, timeout=None, source_address=None, **kwargs):
+        """Route every http.client connection through the tailnet path.
+
+        http.client calls this hook to open the socket; using open_socket means
+        uploads, polling and the WebSocket use the same direct-then-SOCKS5
+        fallback as discovery, so userspace (root-less) Tailscale works end to
+        end instead of only during the health probe.
+        """
+        sock, _ = open_socket(self.host, self.port, self.connect_timeout)
+        sock.settimeout(self.timeout)
+        return sock
+
     def _open_socket(self):
-        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        if self.scheme == "https":
+        raw, _ = open_socket(self.host, self.port, self.connect_timeout)
+        raw.settimeout(self.timeout)
+        if self.scheme != "https":
+            return raw
+        try:
             sock = self._context().wrap_socket(raw, server_hostname=self.host)
             self._verify_peer(sock)
-            return sock
-        return raw
+        except BaseException:
+            raw.close()  # never leak the raw socket if the pin check rejects
+            raise
+        return sock
 
     def request(self, method, path, body=None, headers=None):
         if self.scheme == "https":
             conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout,
                                                context=self._context())
-            conn.connect()
-            self._verify_peer(conn.sock)
         else:
             conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        conn._create_connection = self._create_connection
         try:
+            conn.connect()
+            if self.scheme == "https":
+                self._verify_peer(conn.sock)
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
             data = response.read()
@@ -2758,12 +2913,12 @@ class TowerClient:
                 return False
             while True:
                 op, payload = ws_read(sock, 10.0)
-                if op == "timeout":
-                    return True
-                if op in ("close", "error"):
-                    return op == "close"
+                if op in ("timeout", "close", "error"):
+                    # The live stream ended; the caller falls back to polling
+                    # and keeps printing status updates instead of going silent.
+                    return False
                 if op == "ping":
-                    sock.sendall(ws_frame(b"", opcode=0xA))
+                    sock.sendall(ws_frame(b"", opcode=0xA, mask=True))
                     continue
                 if op in ("text", "binary") and payload:
                     job = json.loads(payload.decode()).get("job")
@@ -2801,9 +2956,12 @@ def print_job_line(job):
 
 
 def choose_attack(client, attack_file=None):
+    return choose_attack_from_listing(client.wordlists(), attack_file)
+
+
+def choose_attack_from_listing(listing, attack_file=None):
     if attack_file:
         return json.loads(Path(attack_file).read_text(encoding="utf-8"))
-    listing = client.wordlists()
     wordlists = listing.get("wordlists", [])
     rules = listing.get("rules", [])
     print("\nAttack type:")
@@ -2815,7 +2973,7 @@ def choose_attack(client, attack_file=None):
     attack = {}
     if kind in (0, 2, 3):
         if not wordlists:
-            raise RuntimeError("The host lists no wordlists. Add .txt files to its wordlist folder.")
+            raise RuntimeError("No wordlists available. Add .txt files to the wordlist folder.")
         print("\nWordlists:")
         for index, item in enumerate(wordlists, 1):
             print(f"  {index}. {item['name']} ({item['size']} bytes)")
@@ -2843,75 +3001,237 @@ def choose_attack(client, attack_file=None):
     return attack
 
 
-def watch_job(client, job_id, tower_url):
-    seen = {"line": None}
+def status_line(job):
+    return json.dumps([job.get("state"), job.get("progress"), job.get("hash_rate")])
 
-    def on_status(job):
-        line = json.dumps([job.get("state"), job.get("progress"), job.get("hash_rate")])
-        if line != seen["line"]:
-            seen["line"] = line
-            print_job_line(job)
 
-    streamed = client.stream_events(job_id, on_status)
-    job = client.job(job_id)
-    deadline = time.monotonic() + 1800
-    while job.get("state") not in ("done", "failed", "cancelled") and time.monotonic() < deadline:
-        if not streamed:
-            print_job_line(job)
-        time.sleep(3)
-        job = client.job(job_id)
-    if job.get("state") not in ("done", "failed", "cancelled"):
-        print(f"Still running. Reattach with: --tower {tower_url} --watch {job_id}")
-        return 0
+def report_job_result(job):
+    if job.get("state") == "failed":
+        print(f"hashcat error: {job.get('error')}")
+        return 1
+    if job.get("state") == "cancelled":
+        print("Job cancelled.")
+        return 1
     result = job.get("result") or {}
-    if job["state"] == "failed":
-        print(f"Host error: {job.get('error')}")
-    elif result.get("found"):
+    if result.get("found"):
         print(f"Password found: {result['password']}")
     else:
         print("Password not found with this attack.")
     return 0
 
 
-def prepare_capture(path):
-    """Convert .pcapng to .hc22000 on the laptop when hcxtools is available.
+def watch_job(client, job_id, tower_url):
+    seen = {"line": None}
+
+    def on_status(job):
+        line = status_line(job)
+        if line != seen["line"]:
+            seen["line"] = line
+            print_job_line(job)
+
+    client.stream_events(job_id, on_status)
+    job = client.job(job_id)
+    deadline = time.monotonic() + 1800
+    while job.get("state") not in ("done", "failed", "cancelled") and time.monotonic() < deadline:
+        # Whether or not the live stream is delivering, poll and print changes
+        # so a dropped WebSocket never makes the UI go silent.
+        line = status_line(job)
+        if line != seen["line"]:
+            seen["line"] = line
+            print_job_line(job)
+        time.sleep(3)
+        job = client.job(job_id)
+    if job.get("state") not in ("done", "failed", "cancelled"):
+        print(f"Still running. Reattach with: --tower {tower_url} --watch {job_id}")
+        return 1
+    return report_job_result(job)
+
+
+def prepare_capture(path, extra_dirs=()):
+    """Convert .pcapng to .hc22000 locally when hcxtools is available.
 
     hcxtools publishes no official Windows binary, so conversion normally
-    happens here. The tower still converts as a fallback if it has the tool.
+    happens on the Linux laptop. A host still converts raw captures as a
+    fallback if it has the tool.
     """
     path = Path(path)
     if path.suffix.lower() == ".hc22000":
         return path
-    converter = find_tool("hcxpcapngtool")
+    converter = find_tool("hcxpcapngtool", extra_dirs)
     if converter is None:
-        print("hcxpcapngtool not found locally; sending the raw capture for the host to convert.")
+        print("hcxpcapngtool not found; passing the raw capture through.")
         return path
     out = path.with_suffix(".hc22000")
     result = subprocess.run([str(converter), "-o", str(out), str(path)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if result.returncode or not out.is_file() or out.stat().st_size == 0:
-        print("Local conversion produced no hashes; sending the raw capture instead.")
+        print("Local conversion produced no hashes; passing the raw capture through.")
         out.unlink(missing_ok=True)
         return path
     print(f"Converted locally: {out}")
     return out
 
 
-def send_capture(args):
-    client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
-    health = client.health()
-    print(f"Host: hashcat={health.get('hashcat_version')} hcxpcapngtool={health.get('hcxpcapngtool')}")
-    capture_path = prepare_capture(args.send)
-    attack = choose_attack(client, args.attack)
-    print("Attack: " + json.dumps(attack))
-    job_id = client.create_job(capture_path, attack)["job_id"]
-    print(f"Job queued: {job_id}")
-    return watch_job(client, job_id, args.tower)
+# ---------------------------------------------------------------------------
+# Local cracking: the same engine as the host, without the HTTP/WebSocket
+# layer. hashcat runs on this machine's GPU and jobs/results live in the same
+# store as the host, so a job can be re-attached or resumed later.
+# ---------------------------------------------------------------------------
+
+def local_config(args):
+    return TowerConfig(
+        host="127.0.0.1", port=0,
+        jobs_dir=getattr(args, "jobs_dir", None) or (app_dir() / "jobs"),
+        tools_dir=getattr(args, "tools_dir", None) or (app_dir() / "tools"),
+        wordlist_dirs=getattr(args, "wordlist_dirs", None) or [app_dir() / "wordlists"],
+        rule_dirs=list(getattr(args, "rule_dirs", None) or []),
+        cert_path=None, key_path=None, tls=False,
+        max_upload_mb=getattr(args, "max_upload_mb", 0),
+        job_timeout=getattr(args, "job_timeout", 0))
 
 
-def reattach(args):
-    client = TowerClient(args.tower, fingerprint=args.fingerprint, insecure=args.insecure)
-    return watch_job(client, args.watch, args.tower)
+def local_engine(args):
+    """Prepare config, tools, job store and a running worker for local cracking."""
+    config = local_config(args)
+    config.jobs_dir.mkdir(parents=True, exist_ok=True)
+    config.potfile.parent.mkdir(parents=True, exist_ok=True)
+    for directory in config.wordlist_dirs:
+        directory.mkdir(parents=True, exist_ok=True)
+    tools = discover_tools(config)
+    print(f"Local tools: hashcat={tools.get('hashcat')}")
+    print(f"GPU backend: {tools.get('backend') or 'auto (none detected)'}")
+    for line in backend_summary(tools.get("backends") or {}):
+        print("  " + line)
+    if not tools.get("hashcat"):
+        raise RuntimeError("hashcat was not found locally. Run --install-tools first.")
+    store = JobStore(config.jobs_dir)
+    worker = TowerWorker(store, config, tools)
+    worker.start()
+    return config, tools, store, worker
+
+
+def local_listing(config):
+    return {"wordlists": inventory(config.wordlist_dirs, WORDLIST_SUFFIXES),
+            "rules": inventory(config.rule_dirs, RULE_SUFFIXES)}
+
+
+def watch_local(store, job_id):
+    seen = {"line": None}
+    while True:
+        job = store.get(job_id)
+        if job is None:
+            fail(f"Unknown local job '{job_id}'.")
+            return 1
+        line = status_line(job)
+        if line != seen["line"]:
+            seen["line"] = line
+            print_job_line(job)
+        if job.get("state") in ("done", "failed", "cancelled"):
+            break
+        time.sleep(1)
+    return report_job_result(job)
+
+
+def submit_local(store, capture, attack):
+    capture = Path(capture)
+    if not capture.is_file():
+        raise RuntimeError(f"Capture file not found: {capture}")
+    job = store.create(attack, capture.name, capture.read_bytes())
+    print(f"Local job queued: {job['id']}")
+    return job["id"]
+
+
+def resume_local(store, job_id):
+    """Re-run a stored job's attack; the shared potfile skips cracked hashes."""
+    job = store.get(job_id)
+    if job is None:
+        raise RuntimeError(f"Unknown local job '{job_id}'.")
+    source = store.job_dir(job_id) / job["filename"]
+    if not source.is_file():
+        raise RuntimeError(f"Capture for job '{job_id}' is missing.")
+    new_job = store.create(job["attack"], job["filename"], source.read_bytes())
+    print(f"Resuming job '{job_id}' as '{new_job['id']}' (the potfile skips cracked hashes).")
+    return new_job["id"]
+
+
+def restore_local(tools, store, job_id):
+    """Resume an interrupted hashcat session via its restore file.
+
+    hashcat's --restore accepts no other arguments than --session, so the job's
+    restore file is copied to the hashcat folder where hashcat looks for
+    ``<session>.restore`` and removed again afterwards.
+    """
+    job = store.get(job_id)
+    if job is None:
+        raise RuntimeError(f"Unknown local job '{job_id}'.")
+    job_dir = store.job_dir(job_id)
+    restore_file = None
+    for name in ("hashcat.restore", "tower.restore"):
+        candidate = job_dir / name
+        if candidate.is_file():
+            restore_file = candidate
+            break
+    if restore_file is None:
+        raise RuntimeError(f"No restore file for job '{job_id}'. "
+                           "Use --resume to re-run the attack instead.")
+    hashcat = Path(tools["hashcat"]).resolve()
+    hashcat_dir = hashcat.parent
+    target = hashcat_dir / "tower.restore"
+    shutil.copyfile(restore_file, target)
+    command = [str(hashcat), "--session", "tower", "--restore"]
+    print("Restoring session: " + " ".join(command))
+    out_file = job_dir / "cracked.txt"
+    last_save = 0.0
+    with (job_dir / "hashcat.log").open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace", cwd=str(hashcat_dir))
+        try:
+            for line in proc.stdout:
+                log.write(line)
+                update = parse_hashcat_status(line)
+                now = time.monotonic()
+                if update and now - last_save >= 1.0:
+                    store.update(job_id, **update)
+                    last_save = now
+        finally:
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            target.unlink(missing_ok=True)
+            (hashcat_dir / "tower.log").unlink(missing_ok=True)
+    if proc.returncode not in (0, 1):
+        raise RuntimeError("hashcat failed: " + hashcat_failure(job_dir / "hashcat.log")
+                           + f" (exit code {signed_exit_code(proc.returncode)})")
+    password = read_cracked(out_file)
+    final = store.update(job_id, state="done", progress=100.0,
+                         result={"found": password is not None, "password": password})
+    print_job_line(final or store.get(job_id))
+    return 0
+
+
+def run_local(args):
+    """Crack on this machine instead of sending the capture to a host."""
+    config, tools, store, worker = local_engine(args)
+    try:
+        if getattr(args, "watch", None):
+            return watch_local(store, args.watch)
+        if getattr(args, "resume", None):
+            return watch_local(store, resume_local(store, args.resume))
+        if getattr(args, "restore_job", None):
+            return restore_local(tools, store, args.restore_job)
+        capture = getattr(args, "local_capture", None) or getattr(args, "send", None)
+        if capture is None:
+            capture = input("Capture file (.pcapng/.hc22000): ").strip()
+        if not capture:
+            raise RuntimeError("No capture file given.")
+        prepared = prepare_capture(Path(capture), config.tool_dirs())
+        attack = choose_attack_from_listing(local_listing(config), args.attack)
+        print("Attack: " + json.dumps(attack))
+        return watch_local(store, submit_local(store, prepared, attack))
+    finally:
+        worker.stop()
 
 
 def self_test():
@@ -3059,19 +3379,33 @@ def self_test():
             pass
         else:
             raise AssertionError(f"extra args accepted: {bad}")
-    try:
-        resolve_named("../secret.txt", [Path(".")], WORDLIST_SUFFIXES)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("path traversal accepted")
+    for bad_name in ("../secret.txt", "sub/../x.txt", "..\\x.txt", ".hidden.txt",
+                     "D:secret.txt", "/etc/passwd", "C:\\Windows\\win.ini"):
+        try:
+            resolve_named(bad_name, [Path(".")], WORDLIST_SUFFIXES)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"suspicious name accepted: {bad_name}")
     assert is_capture_like(b"\x0a\x0d\x0d\x0a\x00\x00\x00\x00")
     assert is_capture_like(b"WPA*01*deadbeef")
     assert not is_capture_like(b"GET / HTTP/1.1")
-    # Tower: websocket framing.
+    # Tower: websocket framing (servers unmasked, clients masked per RFC 6455).
     assert ws_frame(b"hi") == b"\x81\x02hi"
     assert ws_frame(b"x" * 200)[:2] == b"\x81\x7e"
+    masked = ws_frame(b"hi", opcode=0x1, mask=True)
+    assert masked[:2] == b"\x81\x82" and len(masked) == 2 + 4 + 2
     assert ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    # Tower: SOCKS5 target encoding (IPv4/IPv6 literal, else domain ATYP 0x03).
+    assert _socks5_address("100.64.0.1") == b"\x01" + socket.inet_pton(socket.AF_INET, "100.64.0.1")
+    assert _socks5_address("fd7a::1") == b"\x04" + socket.inet_pton(socket.AF_INET6, "fd7a::1")
+    assert _socks5_address("tower") == b"\x03\x05tower"
+    # Tower: certificate pinning keys are unambiguous for IPv6 hosts.
+    assert host_key("100.64.0.1", 8443) == "100.64.0.1:8443"
+    assert host_key("fd7a::1", 8443) == "[fd7a::1]:8443"
+    # Tower: tailnet addresses prefer the SOCKS5 path in userspace mode.
+    assert is_tailnet_address("100.105.183.20") and is_tailnet_address("fd7a:115c:a1e0::1")
+    assert not is_tailnet_address("10.0.0.1") and not is_tailnet_address("tower")
     # Tower: GPU backend selection.
     assert preferred_backend({"cuda": [{"id": 1, "name": "NVIDIA GeForce RTX 4070 SUPER"}],
                               "opencl": [{"id": 2, "type": "GPU", "name": "NVIDIA GeForce RTX 4070 SUPER"}]}) == "cuda"
@@ -3095,6 +3429,7 @@ def self_test():
         store.update(job["id"], state="done", result={"found": True, "password": "abc"})
         assert JobStore(tmp).get(job["id"])["result"]["password"] == "abc"
         assert store.cancel("missing") is False
+        assert store.queue_length() == 0
     with tempfile.TemporaryDirectory(prefix="tower-attack-") as tmp:
         wl_dir, rule_dir = Path(tmp) / "wl", Path(tmp) / "rules"
         wl_dir.mkdir(); rule_dir.mkdir()
@@ -3123,6 +3458,22 @@ def self_test():
         assert config_none.max_upload_mb == 64 and config_none.job_timeout == 0
         parsed = build_parser().parse_args([])
         assert parsed.max_upload_mb == 64 and parsed.job_timeout == 0
+        # A client-sent backend the host does not have must fall back to the
+        # detected one instead of ignoring every available backend.
+        fallback = build_hashcat_command("hashcat", Path(tmp) / "h.hc22000",
+                                         {"type": "mask", "mask": "?d?d", "backend": "cuda"},
+                                         Path(tmp) / "out.txt", Path(tmp) / "pot", config,
+                                         "opencl", ["opencl"])
+        assert "--backend-ignore-opencl" not in fallback
+        both = build_hashcat_command("hashcat", Path(tmp) / "h.hc22000",
+                                     {"type": "mask", "mask": "?d?d", "backend": "cuda"},
+                                     Path(tmp) / "out.txt", Path(tmp) / "pot", config,
+                                     "cuda", ["cuda", "opencl"])
+        assert "--backend-ignore-opencl" in both and "--backend-ignore-cuda" not in both
+        # CLI wiring for local cracking.
+        assert build_parser().parse_args([]).restore_job is None
+        local_args = build_parser().parse_args(["--local-capture", "x.pcapng"])
+        assert local_args.local_capture == Path("x.pcapng")
     if not shutil.which("tshark"):
         print("Self-test passed (pure logic, tower protocol, attack building). "
               "tshark not found; skipping the offline packet test.")
@@ -3256,8 +3607,44 @@ def menu_capture(args):
     return run_capture_cli(args), getattr(args, "last_capture", None)
 
 
+def local_menu(args):
+    """Interactive entry point for local cracking (menu item 9)."""
+    heading("Compute locally on this machine")
+    info("Runs hashcat on the local GPU using the same engine as the host.")
+    answer = input("[n]ew job, [r]esume job, [s]ession restore, [a]ttach to job, "
+                   "[Enter] back: ").strip().lower()
+    if answer == "n":
+        capture = getattr(args, "local_capture", None) or getattr(args, "send", None)
+        if not capture:
+            capture = input("Capture file (.pcapng/.hc22000): ").strip() or None
+        if not capture:
+            warn("No capture file.")
+            return
+        args.local_capture = Path(capture)
+        run_local(args)
+    elif answer == "r":
+        job_id = input("Job id to resume: ").strip()
+        if job_id:
+            args.resume = job_id
+            run_local(args)
+    elif answer == "s":
+        job_id = input("Job id to restore: ").strip()
+        if job_id:
+            args.restore_job = job_id
+            run_local(args)
+    elif answer == "a":
+        job_id = input("Job id to attach: ").strip()
+        if job_id:
+            args.watch = job_id
+            run_local(args)
+
+
 def run_interactive(args):
     while True:
+        # Clear per-action selections so a previous action cannot leak into the
+        # next one (e.g. an old --watch id forcing the attach path).
+        for name in ("send", "watch", "resume", "restore_job", "local_capture"):
+            setattr(args, name, None)
         heading("wifi-handshake - Terminal Menu")
         print("  " + style("1", "bold") + ". Capture handshake  "
               + style("(Linux, monitor mode, root)", "dim"))
@@ -3275,17 +3662,24 @@ def run_interactive(args):
               + style("(status, log in, pick the host in your tailnet)", "dim"))
         print("  " + style("8", "bold") + ". Devices            "
               + style("(list reachable tailnet devices, pick the host)", "dim"))
+        print("  " + style("9", "bold") + ". Compute locally    "
+              + style("(hashcat on this GPU: new, resume, restore, attach)", "dim"))
         print("  " + style("q", "bold") + "  Quit")
         choice = input(style("Choice: ", "bold")).strip().lower()
         if choice == "1":
             code, captured = menu_capture(args)
             if code == 0 and captured:
-                if input("Send this capture to a host now? [y/N] ").strip().lower() == "y":
+                action = input("Send to a host (s), compute locally (l), or skip (n)? "
+                               "[s/l/N] ").strip().lower()
+                if action == "s":
                     if prompt_tower(args):
                         args.send = Path(captured)
                         run_headless(args)
                     else:
                         print("No host URL set. Capture kept at " + captured)
+                elif action == "l":
+                    args.local_capture = Path(captured)
+                    run_local(args)
             continue
         if choice == "2":
             serve(args)
@@ -3335,6 +3729,9 @@ def run_interactive(args):
         if choice == "8":
             choose_tailnet_device(args)
             continue
+        if choice == "9":
+            local_menu(args)
+            continue
         if choice in ("q", ""):
             return 0
         warn("Invalid choice.")
@@ -3364,6 +3761,9 @@ def build_parser():
   python wifi-handshake.py --list-devices        # list reachable tailnet devices
   python wifi-handshake.py --discover-towers     # scan the tailnet for running hosts
   python wifi-handshake.py --send cap.pcapng --tower-name my-host  # find host via Tailscale
+  python wifi-handshake.py --local-capture cap.pcapng  # crack locally on this GPU
+  python wifi-handshake.py --resume 20260924-120000-ab12cd34  # continue a local job
+  python wifi-handshake.py --watch 20260924-120000-ab12cd34   # reattach to a job
 
 Runs on Linux, macOS and Windows. Capture (monitor mode) needs Linux; the host
 and client roles work on every platform. Capture dependencies on Arch:
@@ -3419,9 +3819,19 @@ Only test networks you own or have permission to test.
 
     headless = parser.add_argument_group("non-interactive client (no TUI)")
     headless.add_argument("--send", type=Path, help="send this capture instead of capturing")
-    headless.add_argument("--watch", help="reattach to an existing job id")
+    headless.add_argument("--watch", help="reattach to an existing job id (local job first, else remote)")
     headless.add_argument("--attack", type=Path, help="JSON file with attack parameters")
     headless.add_argument("--fingerprint", help="pinned host certificate sha256 fingerprint")
+
+    local = parser.add_argument_group("local cracking (this machine's GPU, no host)")
+    local.add_argument("--local", action="store_true",
+                       help="crack on this machine instead of sending to a host")
+    local.add_argument("--local-capture", type=Path,
+                       help="capture file for --local (otherwise prompted)")
+    local.add_argument("--resume", metavar="JOB_ID",
+                       help="re-run a stored local job's attack (the potfile skips cracked hashes)")
+    local.add_argument("--restore", dest="restore_job", metavar="JOB_ID",
+                       help="resume an interrupted local session from its restore file")
 
     tailscale = parser.add_argument_group("tailscale (host discovery over the tailnet)")
     tailscale.add_argument("--tower-name", help="tailnet hostname of the host "
@@ -3441,7 +3851,8 @@ Only test networks you own or have permission to test.
 def run_capture_cli(args):
     if not capture_supported():
         raise RuntimeError("Live capture needs Linux (iw/airodump-ng/tshark). "
-                           "On other systems use --serve for the host or --send/--watch.")
+                           "On other systems use --serve for the host, --send/--watch "
+                           "to reach one, or --local to crack here.")
     if args.scan_seconds < 3 or args.timeout < 0 or args.max_mb < 1:
         raise RuntimeError("scan-seconds must be >= 3, timeout >= 0, max-mb >= 1")
     if not sys.stdin.isatty():
@@ -3597,6 +4008,9 @@ def run_capture_cli(args):
 def run_headless(args):
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if args.watch:
+        local_job = (getattr(args, "jobs_dir", None) or (app_dir() / "jobs")) / args.watch
+        if local_job.is_dir():
+            return run_local(args)
         resolve_tower(args)
         if not args.tower and interactive:
             choose_tailnet_device(args)
@@ -3656,6 +4070,8 @@ def main(argv=None):
             print_tailnet_devices(devices)
             warn_host_unavailable(devices, args.port)
             return 0
+        if args.local or args.local_capture or args.resume or args.restore_job:
+            return run_local(args)
         headless = run_headless(args)
         if headless is not None:
             return headless

@@ -117,15 +117,16 @@ wifi-handshake - Terminal Menu
   6. Example captures   (download public test data)
   7. Tailscale          (status, log in, pick the host in your tailnet)
   8. Devices            (list reachable tailnet devices, pick the host)
+  9. Compute locally    (hashcat on this GPU: new, resume, restore, attach)
   q  Quit
 ```
 
-The menu stays open after each action. After a successful capture it asks
-whether to send the file to the host right away (menu item 1 → capture →
-"Send this capture to a host now? [y/N]"). When run without root, the
-`sudo` password is asked **once** at the start of the capture and kept alive
-in the background, so long captures never prompt again; the capture itself runs
-as a child process, so the menu survives.
+The menu stays open after each action. After a successful capture it asks what
+to do with the file (menu item 1 → capture → "Send to a host (s), compute
+locally (l), or skip (n)?"). When run without root, the `sudo` password is
+asked **once** at the start of the capture and kept alive in the background, so
+long captures never prompt again; the capture itself runs as a child process,
+so the menu survives.
 
 The whole interface is **English-only by project rule** (enforced by a comment
 at the top of `wifi-handshake.py`).
@@ -144,11 +145,39 @@ python wifi-handshake.py --run-capture
 ```
 python wifi-handshake.py --tower https://tower:8443 --send capture.pcapng
 ```
+**Local cracking on this machine's GPU (no host):**
+```
+python wifi-handshake.py --local-capture capture.pcapng   # new job
+python wifi-handshake.py --watch 20260924-120000-ab12cd34 # reattach to a job
+python wifi-handshake.py --resume 20260924-120000-ab12cd34 # re-run its attack
+python wifi-handshake.py --restore 20260924-120000-ab12cd34 # resume its session
+```
 Options:
 `--tower URL`, `--tools-dir DIR`, `--output-dir DIR`, `--port N`, `--insecure`,
 `--serve`, `--self-test`, `--inspect FILE`, `--download-captures [DIR]`,
 `--tower-name NAME`, `--tailscale-status`, `--tailscale-login`,
-`--discover-towers`, `--list-devices`.
+`--discover-towers`, `--list-devices`, `--local`, `--local-capture FILE`,
+`--resume JOB_ID`, `--restore JOB_ID`.
+
+### Local cracking (no host)
+
+The same engine that runs on the host also runs **locally**: `--local-capture`
+cracks a capture on this machine's GPU, using the identical tool discovery,
+attack builder, `job_timeout` and job store under `~/.wifi-handshake/jobs/`.
+No HTTP/WebSocket/Tailscale is involved.
+
+* `--local-capture FILE` (or menu item **9 → n**) starts a new local job.
+* `--watch JOB_ID` reattaches to a job and prints live status (local job first,
+  remote host otherwise).
+* `--resume JOB_ID` re-runs a stored job's attack; the shared potfile makes
+  hashcat skip already-cracked hashes.
+* `--restore JOB_ID` resumes an interrupted hashcat session from its restore
+  file (hashcat's `--restore` accepts only `--session`, so the restore file is
+  temporarily placed in the hashcat folder).
+
+Add wordlists to `~/.wifi-handshake/wordlists/`; the shipped hashcat rules are
+used automatically. `--wordlist-dirs` / `--rule-dirs` / `--jobs-dir` override
+the defaults, exactly as for the host.
 
 ### Tailscale (host discovery)
 
@@ -473,7 +502,8 @@ reviewed while building the compatibility layer:
 | [morrownr/USB-WiFi](https://github.com/morrownr/USB-WiFi) | Adapter buying guide: which chipsets do monitor mode / injection on Linux | Great for choosing hardware |
 
 What this project adds on top: a **strictly passive** capture path, a
-self-contained `.hc22000` upload, and GPU cracking over Tailscale.
+self-contained `.hc22000` upload, GPU cracking over Tailscale, and the same
+GPU engine usable **locally** when no host is available.
 
 ---
 
@@ -485,6 +515,10 @@ Start (menu):
   python wifi-handshake.py --run-capture     # capture directly (Linux)
   python wifi-handshake.py --serve --port 8443   # host server
   python wifi-handshake.py --tower URL --send cap.pcapng   # client upload
+  python wifi-handshake.py --local-capture cap.pcapng   # crack locally (GPU)
+  python wifi-handshake.py --watch JOB_ID    # reattach to a job (local or remote)
+  python wifi-handshake.py --resume JOB_ID   # re-run a local job's attack
+  python wifi-handshake.py --restore JOB_ID  # resume a local hashcat session
   python wifi-handshake.py --self-test       # engine tests, no radio
   python wifi-handshake.py --inspect cap.pcapng   # find a handshake offline
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW
@@ -494,7 +528,7 @@ Capture flow (menu item 1):
   choose adapter -> confirm YES -> scan -> pick a network
   -> select EAPOL set (M1+M2 default) -> wait for a handshake
   -> saved as handshake-<date>-<BSSID>.pcapng
-  -> offer to send to the host, then back to the menu
+  -> offer to send to a host or compute locally, then back to the menu
   -> q quit / r rescan
 
 Band/channel options (--run-capture):
