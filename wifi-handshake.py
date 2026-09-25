@@ -27,7 +27,6 @@ PROJECT RULE: all user-facing text is ENGLISH. Do not localize the interface
 import argparse
 import base64
 import collections
-import concurrent.futures
 import contextlib
 import csv
 import getpass
@@ -79,6 +78,11 @@ DEFAULT_PORT = 8443
 # (Linux 32768-60999, Windows 49152-65535), so a running host can never lose its
 # port to an outgoing connection. Override with config.json "ports" or --ports.
 DEFAULT_PORTS = (8443, 9443, 10443, 11443, 12443)
+
+# `tailscale serve` proxies the local host to https://<magicdns>:443 on the
+# tailnet, so a client can reach a host whose OS firewall drops every inbound
+# port. 443 is not part of DEFAULT_PORTS because it is not a plain host port.
+SERVE_PORT = 443
 
 
 def normalize_ports(value):
@@ -384,6 +388,24 @@ def tailscale_peer(name, status=None):
     return None
 
 
+def tailscale_dns_for(host, status=None):
+    """MagicDNS name of the tailnet peer at this IP/hostname, or ``None``."""
+    if not host:
+        return None
+    if is_tailnet_name(host):
+        return host.rstrip(".")
+    status = status or tailscale_status()
+    if not status:
+        return None
+    wanted = host.rstrip(".").lower()
+    for peer in status["peers"]:
+        candidates = {peer["hostname"].lower(), peer["ip"].lower(),
+                      peer["dns_name"].lower(), peer["dns_name"].split(".")[0].lower()}
+        if wanted in candidates:
+            return peer["dns_name"] or None
+    return None
+
+
 def tailscale_tower_endpoint(name="tower", ports=DEFAULT_PORT):
     """Return ``(host, scheme, port)`` for a tailnet peer, or ``None``.
 
@@ -405,6 +427,12 @@ def tailscale_tower_endpoint(name="tower", ports=DEFAULT_PORT):
     if found:
         found_host, scheme, _health, port = found
         return found_host, scheme, port
+    # Firewall-free fallback: a host exposed with the classic single-port
+    # `tailscale serve` answers at https://<magicdns>:443, addressed by name so
+    # the TLS SNI matches the serve certificate.
+    serve = probe_serve(peer["dns_name"])
+    if serve:
+        return peer["dns_name"], serve[0], SERVE_PORT
     hosts = tower_hosts(peer)
     if not hosts:
         return None
@@ -484,7 +512,7 @@ def tailscale_serve_url(status=None):
     return f"https://{name}:443" if name else None
 
 
-def tailscale_serve_status(timeout=15):
+def tailscale_used_serve_ports(timeout=15):
     """Parse ``tailscale serve status`` into the set of used HTTPS ports.
 
     Returns ``{"ports": set(), "raw": str}``. The set lets the host skip a
@@ -560,7 +588,7 @@ def setup_tailscale_serve(local_port, ports, tls=True, timeout=60):
     """
     if not tailscale_available():
         return None
-    used = tailscale_serve_status().get("ports") or set()
+    used = tailscale_used_serve_ports().get("ports") or set()
     for serve_port in normalize_ports(ports):
         if serve_port in used:
             info(f"tailnet port {serve_port} is already served by another entry; "
@@ -1027,29 +1055,19 @@ def probe_tower_ports(host, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, det
     the port it came from.
     """
     ports = normalize_ports(ports)
-    results = {}
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ports)))
 
     def probe(port):
         per = {}
         return port, probe_tower(host, port, timeout, per), per
 
-    try:
-        futures = [pool.submit(probe, port) for port in ports]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                port, found, per = future.result()
-            except Exception:
-                continue
-            results[port] = per
-            if found:
-                for other in futures:
-                    other.cancel()
-                return found[0], found[1], port
-    finally:
-        # Do not block on the losers: they carry at most one short probe timeout
-        # each and are cleaned up when they finish.
-        pool.shutdown(wait=False, cancel_futures=True)
+    # Daemon-thread pool (not ThreadPoolExecutor): see _parallel_map. Ports are
+    # probed concurrently, so a firewall that silently drops several of them
+    # costs one connect timeout instead of one per port.
+    probed = _parallel_map(probe, ports, workers=min(len(ports), 8))
+    results = {port: per for port, _found, per in probed}
+    for port, found, _per in probed:
+        if found:
+            return found[0], found[1], port
     best = None
     for port in ports:  # keep the configured order for a deterministic reason
         per = results.get(port) or {}
@@ -1107,6 +1125,49 @@ def probe_tower_hosts(hosts, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, de
     return None
 
 
+def probe_serve(dns_name, timeout=TOWER_PROBE_TIMEOUT, detail=None):
+    """Probe a tailnet peer's ``tailscale serve`` endpoint (MagicDNS:443).
+
+    Returns ``(scheme, health, SERVE_PORT)`` on success, or ``None``. The host
+    is addressed by its MagicDNS name so the TLS SNI (and the serve certificate)
+    match; the SOCKS5 proxy resolves it in userspace mode.
+    """
+    if not dns_name or not is_tailnet_name(dns_name):
+        return None
+    found = probe_tower(dns_name, SERVE_PORT, timeout, detail)
+    return (found[0], found[1], SERVE_PORT) if found else None
+
+
+def _parallel_map(func, items, workers=16):
+    """Map ``func`` over ``items`` using daemon threads, preserving order.
+
+    ``concurrent.futures.ThreadPoolExecutor`` registers non-daemon workers that
+    an ``atexit`` handler joins at interpreter exit. A Ctrl+C during a slow
+    probe then prints a ``concurrent.futures`` traceback from that handler.
+    Daemon threads are discarded instead, so cancelling a scan stays clean.
+    """
+    results = [None] * len(items)
+    if not items:
+        return results
+    slots = threading.Semaphore(max(1, min(workers, len(items))))
+    threads = []
+
+    def run(index, item):
+        try:
+            results[index] = func(item)
+        finally:
+            slots.release()
+
+    for index, item in enumerate(items):
+        slots.acquire()
+        thread = threading.Thread(target=run, args=(index, item), daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    return results
+
+
 def scan_tailnet_devices(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
     """List every online tailnet device with latency and tower status.
 
@@ -1140,31 +1201,31 @@ def scan_tailnet_devices(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TI
             entry["latency"] = connect_latency(host, ports[0], timeout)
         detail = {}
         found = probe_tower_hosts(hosts, ports, timeout, detail) if hosts else None
-        entry["tower"] = found is not None
         if found:
-            found_host, scheme, health, port = found
+            url_host, scheme, health, port = found
+        else:
+            # Firewall-free path: a peer may expose the host via the classic
+            # single-port `tailscale serve` at https://<magicdns>:443 instead of
+            # an open inbound port.
+            serve = probe_serve(entry["dns_name"], timeout, detail)
+            if serve:
+                scheme, health, port = serve
+                url_host = entry["dns_name"]
+                entry["serve"] = True
+            else:
+                scheme = health = port = None
+        entry["tower"] = port is not None
+        if entry["tower"]:
             entry["scheme"], entry["health"], entry["probe_port"] = scheme, health, port
-            entry["url"] = f"{scheme}://{found_host}:{port}"
+            entry["url"] = f"{scheme}://{url_host}:{port}"
         else:
             entry["probe_port"] = detail.get("port") or ports[0]
             entry["probe_error"] = detail.get("error")
         return entry
 
     if entries:
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(entries)))
-        interrupted = False
-        try:
-            entries = list(pool.map(probe, entries))
-        except KeyboardInterrupt:
-            # Return immediately; leave the in-flight probes to drain in the
-            # background (daemon threads) instead of blocking on them, so
-            # Ctrl+C is instant and no stray thread blocks interpreter exit.
-            interrupted = True
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            if not interrupted:
-                pool.shutdown(wait=True)
+        # Daemon-thread pool (not ThreadPoolExecutor): see _parallel_map.
+        entries = _parallel_map(probe, entries, workers=min(16, len(entries)))
     entries.sort(key=lambda entry: (not entry["online"], entry["hostname"].lower()))
     return entries
 
@@ -1255,6 +1316,9 @@ def warn_host_unavailable(devices, ports=DEFAULT_PORT):
              f"answers with '{reason}' — another service uses it. Start the host "
              f"there with: python wifi-handshake.py --serve (it picks the first "
              f"free port from {ports}); the client scans the same list.")
+        info(f"Firewall-free alternative: on '{name}' run "
+             f"`python wifi-handshake.py --serve --tailscale-serve` and connect "
+             f"via the MagicDNS name (https://<name>.ts.net:443).")
     else:
         warn(f"Configured host '{name}' is online but does not answer on the host "
              f"service (ports {ports}). Start it there with: python "
@@ -1265,6 +1329,9 @@ def warn_host_unavailable(devices, ports=DEFAULT_PORT):
             info(f"'{name}' runs Windows: if the host is running there but still "
                  f"unreachable, Windows Firewall is dropping the port. Allow it "
                  f"in an admin PowerShell: {windows_firewall_hint(ports)}")
+            info(f"Or skip the firewall entirely: on '{name}' run "
+                 f"`python wifi-handshake.py --serve --tailscale-serve` and "
+                 f"connect via https://<name>.ts.net:443.")
 
 
 def discover_tailnet_towers(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TIMEOUT):
@@ -3682,7 +3749,10 @@ def serve(args):
     # on by default; --no-tailscale-serve turns it off.
     exposed = None
     if tailscale_ready(tailnet) and not getattr(args, "no_tailscale_serve", False):
-        exposed = setup_tailscale_serve(config.port, configured_ports(args), tls=bool(context))
+        # Try the classic :443 first, then the configured candidate ports, so a
+        # machine that already serves/funnels other services keeps them.
+        exposed = setup_tailscale_serve(config.port, [SERVE_PORT, *configured_ports(args)],
+                                        tls=bool(context))
     if exposed:
         print(f"Tailnet-only, firewall-free URL: {exposed}")
     if os.name == "nt" and not exposed:
@@ -4620,6 +4690,31 @@ def self_test():
         assert "8443,9443" in windows_firewall_hint([8443, 9443])
     finally:
         _multi_httpd.shutdown()
+    # Parallel device probing uses daemon threads (not ThreadPoolExecutor), so a
+    # Ctrl+C during a scan does not dump a concurrent.futures traceback at exit.
+    assert _parallel_map(lambda value: value * 2, [1, 2, 3]) == [2, 4, 6]
+    assert _parallel_map(lambda value: value, []) == []
+    # `tailscale serve` probing only applies to MagicDNS names, and its replies
+    # get an actionable hint (502 = serve configured but backend down).
+    assert probe_serve("100.105.183.20") is None
+    assert probe_serve("") is None
+    assert describe_serve_reply(None) == "no answer"
+    assert "backend is down" in describe_serve_reply("HTTP 502")
+    assert "not the wifi-handshake host" in describe_serve_reply("HTTP 400")
+    assert describe_serve_reply("no answer") == "no answer"
+    # MagicDNS lookup maps a peer IP/hostname back to its name for the serve probe.
+    _real_ts_status = globals()["tailscale_status"]
+    try:
+        globals()["tailscale_status"] = lambda *a, **k: {
+            "state": "Running", "peers": [
+                {"hostname": "tower", "dns_name": "tower.tail.ts.net",
+                 "ip": "100.64.0.9", "os": "windows", "online": True, "active": True}]}
+        assert tailscale_dns_for("100.64.0.9") == "tower.tail.ts.net"
+        assert tailscale_dns_for("tower") == "tower.tail.ts.net"
+        assert tailscale_dns_for("tower.tail.ts.net") == "tower.tail.ts.net"
+        assert tailscale_dns_for("nope") is None
+    finally:
+        globals()["tailscale_status"] = _real_ts_status
     busy = [{"hostname": "tower", "ip": "127.0.0.1", "online": True, "self": False,
              "latency": 1.0, "tower": False, "probe_port": 9, "probe_error": "HTTP 401"}]
     with contextlib.redirect_stdout(io.StringIO()) as probe_out:
@@ -4797,7 +4892,7 @@ def self_test():
             "# Funnel on:\n#     - https://jannistower.tailfcf2d7.ts.net:8443\n"
             "https://jannistower.tailfcf2d7.ts.net (Funnel on)\n"
             "|-- / proxy http://127.0.0.1:5173\n")
-        used = tailscale_serve_status()["ports"]
+        used = tailscale_used_serve_ports()["ports"]
         assert used == {443, 8443}, used
         globals()["tailscale_available"] = lambda: True
         calls = []
@@ -5079,7 +5174,7 @@ def connection_test(args, timeout=TOWER_PROBE_TIMEOUT):
     On success it sets ``args.tower``/``args.port`` and returns the port.
     """
     ports = configured_ports(args)
-    host = label = peer_os = None
+    host = label = peer_os = dns_name = None
     tower = getattr(args, "tower", None)
     if tower:
         parsed = urllib.parse.urlsplit(tower if "://" in tower else "https://" + tower)
@@ -5091,10 +5186,12 @@ def connection_test(args, timeout=TOWER_PROBE_TIMEOUT):
             if peer:
                 host = peer["ip"] or peer["dns_name"]
                 peer_os = peer.get("os")
+                dns_name = peer.get("dns_name")
                 label = f"{name} ({host})"
     if not host:
         warn("No host to test. Pick one under Setup -> Devices, or pass --tower URL.")
         return None
+    dns_name = dns_name or tailscale_dns_for(host)
     info(f"Pre-flight check for {label} on ports {ports} ...")
     for port in ports:
         detail = {}
@@ -5110,12 +5207,208 @@ def connection_test(args, timeout=TOWER_PROBE_TIMEOUT):
             warn(f"{host}:{port} -> {reason} (another service uses this port)")
         else:
             info(f"{host}:{port} -> {reason}")
-    warn(f"No wifi-handshake host answered on {ports}.")
-    info("On the host, run: python wifi-handshake.py --serve (it picks the first free port).")
+    # Firewall-free fallback: the host may be exposed via `tailscale serve`.
+    if dns_name:
+        detail = {}
+        serve = probe_serve(dns_name, timeout, detail)
+        if serve:
+            args.tower = f"{serve[0]}://{dns_name}:{SERVE_PORT}"
+            args.port = SERVE_PORT
+            ok(f"{dns_name}:{SERVE_PORT} is a wifi-handshake host via tailscale "
+               f"serve ({serve[0]})")
+            ok("Host ready: " + args.tower)
+            return SERVE_PORT
+        info(f"{dns_name}:{SERVE_PORT} -> "
+             f"{describe_serve_reply(detail.get('error'))}")
+    warn(f"No wifi-handshake host answered on {ports}"
+         + (f" or via tailscale serve ({dns_name}:{SERVE_PORT})" if dns_name else "")
+         + ".")
+    info("On the host, run: python wifi-handshake.py --serve (it picks the first "
+         "free port), or --serve --tailscale-serve (firewall-free).")
     if str(peer_os or "").lower().startswith("win"):
         info(f"'{label}' runs Windows: if the host is running but unreachable, allow "
              f"the ports (admin PowerShell): {windows_firewall_hint(ports)}")
     return None
+
+
+def describe_serve_reply(error):
+    """Human hint for the result of a ``tailscale serve`` (MagicDNS:443) probe."""
+    if not error:
+        return "no answer"
+    if error.startswith("HTTP 502"):
+        return ("HTTP 502 — tailscale serve is configured here but its backend "
+                "is down; start the host on the port serve points at")
+    if error.startswith("HTTP 4"):
+        return (f"{error} — something answers on :{SERVE_PORT} but is not the "
+                "wifi-handshake host")
+    return error
+
+
+def tailscale_serve_status():
+    """Return the ``tailscale serve status`` text, or ``None`` if unavailable."""
+    command = tailscale_command("serve", "status")
+    if command is None:
+        return None
+    try:
+        result = subprocess.run(command, text=True, timeout=15,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (result.stdout or "").strip()
+
+
+def windows_firewall_rules():
+    """Names of existing ``wifi-handshaker*`` firewall rules, or None off Windows."""
+    if os.name != "nt":
+        return None
+    command = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+               "Get-NetFirewallRule -DisplayName 'wifi-handshaker*' | "
+               "Select-Object -ExpandProperty DisplayName"]
+    try:
+        result = subprocess.run(command, text=True, timeout=30,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def doctor(args):
+    """Diagnose host/client reachability and print concrete next steps.
+
+    Runs the same checks a real send would: Tailscale state and SOCKS5 proxy,
+    the host health handshake on every candidate port, the firewall-free
+    ``tailscale serve`` endpoint, local host tools and (on Windows) firewall
+    rules. Every problem found is turned into an actionable step.
+    """
+    ports = configured_ports(args)
+    heading("Doctor")
+    info(f"Platform: {platform_name()}  Python: {sys.version.split()[0]}")
+    steps = []
+
+    print()
+    print(style("Tailscale", "bold"))
+    status = None
+    if not tailscale_available():
+        warn("Tailscale is not installed.")
+        steps.append("Install Tailscale: https://tailscale.com/download")
+    else:
+        status = tailscale_status()
+        if not tailscale_ready(status):
+            label = status["state_label"] if status else "no status"
+            warn(f"Tailscale is not running ({label}).")
+            steps.append("Start Tailscale: sudo tailscale up (Linux) or tailscale up")
+        else:
+            ok(f"Running as {status['self_hostname']} ({status['self_ip']})")
+            if status["self_dns_name"]:
+                info(f"MagicDNS name: {status['self_dns_name']}")
+    proxy = tailscale_proxy()
+    if proxy:
+        ok(f"SOCKS5 proxy detected at {proxy[0]}:{proxy[1]}")
+    else:
+        info("No SOCKS5 proxy detected (only needed in userspace networking mode).")
+
+    print()
+    print(style("Tailscale serve (firewall-free path)", "bold"))
+    serve_status = tailscale_serve_status()
+    if serve_status:
+        print(serve_status)
+    else:
+        info("No `tailscale serve` configuration here (or Tailscale unavailable).")
+
+    print()
+    print(style("Host reachability", "bold"))
+    tower = getattr(args, "tower", None)
+    name = getattr(args, "tower_name", None) or load_config().get("tower_name")
+    host = dns_name = peer_os = None
+    if tower:
+        parsed = urllib.parse.urlsplit(tower if "://" in tower else "https://" + tower)
+        host = parsed.hostname
+        dns_name = tailscale_dns_for(host, status)
+    elif name:
+        peer = tailscale_peer(name, status) if status else None
+        if peer:
+            host = peer["ip"] or peer["dns_name"]
+            dns_name = peer["dns_name"]
+            peer_os = peer.get("os")
+    if not host:
+        info("No host configured. Pick one under Setup -> Devices, or pass --tower URL.")
+        steps.append("Pick the host: Setup (7) -> Devices (2).")
+    else:
+        info(f"Configured host: {name or tower} -> {host}")
+        found_any = False
+        for port in ports:
+            detail = {}
+            found = probe_tower(host, port, TOWER_PROBE_TIMEOUT, detail)
+            if found:
+                ok(f"{host}:{port} -> host ({found[0]})")
+                found_any = True
+            else:
+                warn(f"{host}:{port} -> {detail.get('error') or 'no answer'}")
+        if dns_name:
+            detail = {}
+            serve = probe_serve(dns_name, TOWER_PROBE_TIMEOUT, detail)
+            if serve:
+                ok(f"{dns_name}:{SERVE_PORT} -> host via tailscale serve ({serve[0]})")
+                found_any = True
+            else:
+                info(f"{dns_name}:{SERVE_PORT} -> "
+                     f"{describe_serve_reply(detail.get('error'))}")
+        if found_any:
+            ok("A wifi-handshake host answered. You are ready to send.")
+        else:
+            warn("No wifi-handshake host answered.")
+            steps.append("On the host run: python wifi-handshake.py --serve "
+                         "(or --serve --tailscale-serve for the firewall-free path).")
+            if str(peer_os or "").lower().startswith("win") or os.name == "nt":
+                steps.append("Windows host: allow the ports in an admin PowerShell: "
+                             + windows_firewall_hint(ports))
+
+    print()
+    print(style("Host tools (this machine)", "bold"))
+    config = TowerConfig(
+        host=args.bind, port=ports[0],
+        jobs_dir=args.jobs_dir or (app_dir() / "jobs"),
+        tools_dir=args.tools_dir or (app_dir() / "tools"),
+        wordlist_dirs=args.wordlist_dirs or [app_dir() / "wordlists"],
+        rule_dirs=list(args.rule_dirs or []),
+        cert_path=args.cert, key_path=args.key, tls=not args.no_tls,
+        max_upload_mb=args.max_upload_mb, job_timeout=args.job_timeout)
+    tools = discover_tools(config)
+    if tools.get("hashcat"):
+        ok(f"hashcat: {tools.get('hashcat_version') or tools['hashcat']}")
+    else:
+        info("hashcat not found (only needed on the host: --install-tools).")
+    if tools.get("hcxpcapngtool"):
+        ok("hcxpcapngtool found")
+    else:
+        info("hcxpcapngtool not found (needed to convert .pcapng uploads on the host).")
+    if tools.get("backend"):
+        ok(f"GPU backend: {tools['backend']}")
+    else:
+        info("No GPU backend detected (cracking would fall back to CPU).")
+
+    rules = windows_firewall_rules()
+    if rules is not None:
+        print()
+        print(style("Windows Firewall", "bold"))
+        if rules:
+            ok("Rules present: " + ", ".join(rules))
+        else:
+            warn("No wifi-handshaker firewall rule found.")
+            steps.append("Add it in an admin PowerShell: " + windows_firewall_hint(ports))
+
+    print()
+    if not steps:
+        ok("No problems found.")
+    else:
+        print(style("Next steps", "bold"))
+        for index, step in enumerate(steps, 1):
+            print(f"  {index}. {step}")
+    return 0
 
 
 def menu_firewall(args):
@@ -5150,7 +5443,7 @@ def menu_tailscale_serve(args):
          "tailnet only; Funnel (public internet) is never used.")
     answer = input(f"Local host port to expose [{ports[0]}]: ").strip()
     port = int(answer) if answer.isdecimal() and 0 < int(answer) < 65536 else ports[0]
-    if setup_tailscale_serve(port, ports):
+    if setup_tailscale_serve(port, [SERVE_PORT, *ports]):
         print("Stop sharing with: python wifi-handshake.py --tailscale-serve-reset")
 
 
@@ -5174,6 +5467,8 @@ def menu_setup(args):
               + style(f"(current: {label})", "dim"))
         print("  " + style("7", "bold") + ". Help / Install      "
               + style("(--help, download hashcat)", "dim"))
+        print("  " + style("8", "bold") + ". Doctor              "
+              + style("(diagnose reachability and print next steps)", "dim"))
         print("  " + style("b", "bold") + "  Back")
         choice = input(style("Setup choice: ", "bold")).strip().lower()
         if choice == "1":
@@ -5199,6 +5494,8 @@ def menu_setup(args):
         elif choice == "7":
             print("Installing hashcat ...")
             install_tools(args.tools_dir)
+        elif choice == "8":
+            doctor(args)
         elif choice in ("b", "", "q"):
             return
         else:
@@ -5307,6 +5604,7 @@ def build_parser():
   python wifi-handshake.py --tailscale-status    # show the tailnet and peers
   python wifi-handshake.py --list-devices        # list reachable tailnet devices
   python wifi-handshake.py --discover-towers     # scan the tailnet for running hosts
+  python wifi-handshake.py --doctor              # diagnose reachability + next steps
   python wifi-handshake.py --send cap.pcapng --tower-name my-host  # find host via Tailscale
   python wifi-handshake.py --local-capture cap.pcapng  # crack locally on this GPU
   python wifi-handshake.py --resume 20260924-120000-ab12cd34  # continue a local job
@@ -5407,6 +5705,9 @@ Only test networks you own or have permission to test.
                            help="do not configure `tailscale serve` automatically")
     tailscale.add_argument("--tailscale-serve-reset", action="store_true",
                            help="remove all `tailscale serve` configuration, then exit")
+    tailscale.add_argument("--doctor", action="store_true",
+                           help="diagnose reachability (Tailscale, ports, serve, "
+                                "tools, firewall) and print next steps")
     return parser
 
 
@@ -5630,7 +5931,7 @@ def main(argv=None):
         if args.tailscale_serve and not args.serve:
             # Standalone: expose an already-running host (pass --port for its port).
             ports = configured_ports(args)
-            url = setup_tailscale_serve(ports[0], ports)
+            url = setup_tailscale_serve(ports[0], [SERVE_PORT, *ports])
             return 0 if url else 1
         if args.discover_towers:
             if not tailscale_ready():
@@ -5647,6 +5948,8 @@ def main(argv=None):
             print_tailnet_devices(devices)
             warn_host_unavailable(devices, ports)
             return 0
+        if args.doctor:
+            return doctor(args)
         if args.local or args.local_capture or args.resume or args.restore_job:
             return run_local(args)
         headless = run_headless(args)

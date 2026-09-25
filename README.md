@@ -151,6 +151,7 @@ Setup
   5. Expose via Tailscale (serve the host firewall-free at :443)
   6. Host ports         (change the port list used by host and client)
   7. Help / Install     (--help, download hashcat)
+  8. Doctor             (diagnose reachability and print next steps)
   b  Back
 ```
 
@@ -289,6 +290,33 @@ Without a terminal (no TTY), `--send`/`--watch` require `--tower` or
 
 `--serve` prints the tailnet IP and the port it actually bound, e.g.
 `use: --tower https://100.x.y.z:9443`.
+
+**Firewall-free path (`tailscale serve`).** When the host's firewall drops
+inbound ports (the common Windows case), the host can expose itself through
+tailscaled instead, so **no inbound port has to be opened**. On the host:
+
+```
+python wifi-handshake.py --serve --tailscale-serve
+```
+
+tailscaled proxies the local HTTPS host to `https://<magicdns>:443`. The client
+finds it automatically: `--list-devices`, the device picker and
+`--discover-towers` also probe every peer's **MagicDNS name on `:443`**, so a
+serve-exposed host shows up like any other. A manual URL works too:
+
+```
+python wifi-handshake.py --tower https://jannistower.tailfcf2d7.ts.net:443 --send cap.pcapng
+```
+
+Remove the exposure with `--tailscale-serve-reset`.
+
+**`--doctor`** (also **Setup → 8 – Doctor**) runs the whole pre-flight in one
+go: Tailscale state and SOCKS5 proxy, the host health handshake on every
+candidate port, the `tailscale serve` endpoint, local host tools and (on
+Windows) existing firewall rules — then prints a numbered *next steps* list. It
+interprets a `tailscale serve` reply: `HTTP 502` means serve is configured but
+its backend is down (start the host on the served port); `HTTP 4xx` means
+something else answers on `:443`.
 
 If Tailscale is not installed or the daemon is not running the helpers only warn
 and the tool keeps working with an explicit `--tower URL`. A userspace daemon
@@ -429,9 +457,11 @@ python wifi-handshake.py --serve --tailscale-serve
 ```
 This prints a client URL such as
 `https://jannistower.tailfcf2d7.ts.net:443`; connect the laptop with
-`--tower https://jannistower.tailfcf2d7.ts.net:443`. It requires HTTPS
-certificates in the tailnet (admin console → **DNS → HTTPS Certificates**).
-Undo with `--tailscale-serve-reset`.
+`--tower https://jannistower.tailfcf2d7.ts.net:443` — or just pick the host in
+menu **3 – Send capture**, which also probes the peer's MagicDNS name on `:443`
+and finds the serve-exposed host automatically. It requires HTTPS certificates
+in the tailnet (admin console → **DNS → HTTPS Certificates**). Undo with
+`--tailscale-serve-reset`.
 
 ### Step 2 – Capture a handshake (Laptop)
 Via menu item **1 – Capture handshake** (or `--run-capture`):
@@ -591,6 +621,31 @@ project folder, new captures are written to `captures/` (override with
 | Device list shows `! HTTP 401` (or another status) instead of a host | another service already listens on that port. Run `--serve` (without `--port`): it picks the first free port from the list and the client scans the same list. Verify with **Setup → 3 – Connection test**. |
 | Host is online but **every** port times out (no answer, not refused) | Windows Defender Firewall is dropping the inbound ports. Add a rule for the list (**Setup → 4 – Firewall**) or skip the firewall entirely with `--serve --tailscale-serve` (reachable at `https://<magicdns>:443`). |
 | Capture runs but never finds EAPOL | the test device must reconnect, and it must join exactly the selected SSID/band. The tool prints hint messages; if the AP broadcasts several SSIDs (same AP base MAC), pick the one the device actually joins. Toggling Wi-Fi on the device creates a fresh four-way handshake. |
+| `--doctor` says `HTTP 502` on `<magicdns>:443` | `tailscale serve` is configured on that peer but its backend is down. Run `tailscale serve status` there to see the served port and start the host on it, or `--tailscale-serve-reset` and `--serve --tailscale-serve` again. |
+
+### Diagnostic scripts (isolate network from code)
+
+Two tiny, dependency-free scripts in `diagnostics/` answer "is it the
+firewall/network, or is it the tool?" independently of `wifi-handshake.py`:
+
+```
+# on the machine to reach (e.g. the Windows GPU box):
+python diagnostics/echo_host.py --ports 8443,9443,10443,11443,12443
+
+# on the other machine:
+python diagnostics/echo_client.py --host 100.105.183.20
+python diagnostics/echo_client.py --host 100.105.183.20 --count 3
+```
+
+`echo_host.py` listens on every port at once and answers each line with a magic
+pong, the same bytes (echo), or both (`--mode pong|echo|both|silent`). It logs
+every connection, so you can see whether packets arrive even when no reply comes
+back. `echo_client.py` scans the same port list and reports per port: `pong` /
+`echo` / `both` (working), `refused` (port reachable, nothing listening),
+`timeout` (dropped — firewall or no route), `no-reply` (connected but silent) or
+`foreign` (another service). The userspace-Tailscale SOCKS5 proxy on
+`127.0.0.1:1056` is auto-detected (`--proxy` / `--no-proxy` override). Exit
+code 0 means at least one port answered.
 
 ---
 
@@ -656,6 +711,16 @@ Start (menu):
   python wifi-handshake.py --inspect cap.pcapng   # find a handshake offline
   python wifi-handshake.py --inspect cap.pcapng --essid SSID --password PW
   python wifi-handshake.py --download-captures    # example captures -> ./examples
+
+Tailscale:
+  python wifi-handshake.py --tailscale-status     # node + peers
+  python wifi-handshake.py --list-devices         # all devices, marks hosts
+  python wifi-handshake.py --doctor               # diagnose + next steps
+  python wifi-handshake.py --serve --tailscale-serve   # host, firewall-free :443
+
+Diagnostics (independent of the engine, no deps):
+  python diagnostics/echo_host.py --ports 8443,9443,10443,11443,12443
+  python diagnostics/echo_client.py --host 100.105.183.20 --count 3
 
 Capture flow (menu item 1):
   choose adapter -> confirm YES -> scan -> pick a network
