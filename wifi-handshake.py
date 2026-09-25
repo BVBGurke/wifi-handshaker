@@ -335,12 +335,20 @@ def tailscale_status(timeout=10):
     self_node = data.get("Self") or {}
     peers = []
     for node in (data.get("Peer") or {}).values():
+        hostname = node.get("HostName") or ""
+        tags = [str(tag).lower() for tag in (node.get("Tags") or [])]
+        # Tailscale's own Funnel ingress proxies appear as peers with
+        # tag:ingress. They are not user devices; probing them only wastes time
+        # and prints misleading "another service already uses it" warnings.
+        if "tag:ingress" in tags or hostname.lower().startswith("funnel-ingress-node"):
+            continue
         addresses = node.get("TailscaleIPs") or []
         peers.append({
-            "hostname": node.get("HostName") or "",
+            "hostname": hostname,
             "dns_name": (node.get("DNSName") or "").rstrip("."),
             "ip": addresses[0] if addresses else "",
             "os": node.get("OS") or "",
+            "tags": tags,
             "online": bool(node.get("Online")),
             "active": bool(node.get("Active")),
         })
@@ -379,10 +387,12 @@ def tailscale_peer(name, status=None):
 def tailscale_tower_endpoint(name="tower", ports=DEFAULT_PORT):
     """Return ``(host, scheme, port)`` for a tailnet peer, or ``None``.
 
-    The peer's tailnet IP is preferred. Every candidate port is probed with the
-    health handshake, so the working port (and HTTPS vs ``--no-tls`` HTTP) is
-    discovered instead of assumed. Falls back to the first port and ``https``
-    when the host does not answer (the caller then produces the usual error).
+    Both the peer's tailnet IP and its MagicDNS name are probed across every
+    candidate port with the health handshake, so the working endpoint (and
+    HTTPS vs ``--no-tls`` HTTP) is discovered instead of assumed — including a
+    firewall-free ``tailscale serve`` host, which only answers on the DNS name.
+    Falls back to the first host/port and ``https`` when nothing answers (the
+    caller then produces the usual error).
     """
     status = tailscale_status()
     if not tailscale_ready(status):
@@ -390,14 +400,15 @@ def tailscale_tower_endpoint(name="tower", ports=DEFAULT_PORT):
     peer = tailscale_peer(name, status)
     if not peer:
         return None
-    host = peer["ip"] or peer["dns_name"]
-    if not host:
-        return None
     ports = normalize_ports(ports)
-    found = probe_tower_ports(host, ports)
+    found = probe_tower_hosts(peer, ports)
     if found:
-        return host, found[0], found[2]
-    return host, "https", ports[0]
+        found_host, scheme, _health, port = found
+        return found_host, scheme, port
+    hosts = tower_hosts(peer)
+    if not hosts:
+        return None
+    return hosts[0], "https", ports[0]
 
 
 def tailscale_tower_url(name="tower", ports=DEFAULT_PORT, scheme="https"):
@@ -473,19 +484,44 @@ def tailscale_serve_url(status=None):
     return f"https://{name}:443" if name else None
 
 
-def tailscale_serve(port, timeout=60):
-    """Expose a local HTTPS host on the tailnet via ``tailscale serve``.
+def tailscale_serve_status(timeout=15):
+    """Parse ``tailscale serve status`` into the set of used HTTPS ports.
 
-    Runs ``tailscale serve --bg https+insecure://localhost:<port>`` so the host
-    is reachable at ``https://<magicdns>:443`` even when the OS firewall drops
-    every other inbound port (the common Windows case). The tailnet's HTTPS
-    certificates must be enabled (admin console -> DNS -> HTTPS Certificates).
-    Returns the client URL, or None on failure.
+    Returns ``{"ports": set(), "raw": str}``. The set lets the host skip a
+    tailnet-side port that an existing serve/funnel entry already owns (users
+    commonly run Funnel for other services on :443 or :8443), so adding a rule
+    for this tool never clobbers unrelated configuration.
+    """
+    result = _tailscale("serve", "status", timeout=timeout)
+    if result is None or result.returncode:
+        return {"ports": set(), "raw": ""}
+    raw = result.stdout or ""
+    ports = set()
+    for match in re.finditer(r"https://([^/\s:]+)(?::(\d+))?", raw):
+        ports.add(int(match.group(2)) if match.group(2) else 443)
+    return {"ports": ports, "raw": raw}
+
+
+def tailscale_serve(port, serve_port=None, tls=True, timeout=60):
+    """Expose a local host on the tailnet via ``tailscale serve`` (firewall-free).
+
+    Runs ``tailscale serve --bg --https=<serve_port> https+insecure://localhost:<port>``
+    so the host is reachable at ``https://<magicdns>:<serve_port>`` even when the
+    OS firewall drops every other inbound port (the common Windows case). This
+    stays **tailnet-only**; ``tailscale funnel`` would additionally expose it to
+    the public internet and is deliberately not used here.
+
+    ``serve_port`` defaults to 443 (the classic single-port form). Returns the
+    client URL, or None on failure.
     """
     if not tailscale_available():
         warn("Tailscale is not installed. See https://tailscale.com/download")
         return None
-    command = tailscale_command("serve", "--bg", f"https+insecure://localhost:{port}")
+    port = normalize_ports(port)[0]
+    serve_port = 443 if serve_port is None else normalize_ports(serve_port)[0]
+    scheme = SERVE_SCHEME_INSECURE if tls else SERVE_SCHEME_PLAIN
+    command = tailscale_command("serve", "--bg", f"--https={serve_port}",
+                                f"{scheme}://localhost:{port}")
     if command is None:
         warn("Tailscale is not installed. See https://tailscale.com/download")
         return None
@@ -504,12 +540,41 @@ def tailscale_serve(port, timeout=60):
         info("If HTTPS is disabled for the tailnet, enable it in the admin console "
              "(DNS -> HTTPS Certificates).")
         return None
-    url = tailscale_serve_url()
-    if not url:
+    status = tailscale_status()
+    name = (status or {}).get("self_dns_name")
+    if not name:
         return None
+    url = f"https://{name}:{serve_port}"
     ok(f"Host exposed on the tailnet: {url}")
     print("  Client: python wifi-handshake.py --tower " + url)
     return url
+
+
+def setup_tailscale_serve(local_port, ports, tls=True, timeout=60):
+    """Expose ``local_port`` on the first tailnet-side port that is actually free.
+
+    Tries the candidate ``ports`` in order and skips any already owned by an
+    existing serve/funnel entry, so a machine that already Funnels other
+    services keeps those untouched. Returns the firewall-free client URL, or
+    None when every candidate is taken or serve is unavailable.
+    """
+    if not tailscale_available():
+        return None
+    used = tailscale_serve_status().get("ports") or set()
+    for serve_port in normalize_ports(ports):
+        if serve_port in used:
+            info(f"tailnet port {serve_port} is already served by another entry; "
+                 f"trying the next candidate.")
+            continue
+        url = tailscale_serve(local_port, serve_port=serve_port, tls=tls, timeout=timeout)
+        if url:
+            return url
+    if used:
+        warn(f"Every candidate port {normalize_ports(ports)} is already served on "
+             f"the tailnet ({sorted(used)}). Free one, or pass --ports with a "
+             f"fresh port.")
+    return None
+
 
 
 def tailscale_serve_reset():
@@ -556,11 +621,19 @@ def choose_tailscale_tower(args):
     return args.tower
 
 
-TOWER_PROBE_TIMEOUT = 2.0
+# A dead host (or a tailnet port silently dropped by a firewall) must not make
+# discovery feel like a hang. Ports are probed in parallel, so the whole scan
+# costs roughly one connect timeout instead of timeout * number-of-ports.
+TOWER_PROBE_TIMEOUT = 1.5
 # Connect and I/O budgets are deliberately separate: probes must give up
 # quickly on dead hosts (connect timeout) while leaving headroom for a TLS
 # handshake and response over a laggy tailnet link (I/O timeout).
 PROBE_IO_TIMEOUT = 6.0
+# `tailscale serve` maps a tailnet-side HTTPS port to the local host. The
+# tailnet-side port is picked from the same candidate list as the local bind
+# port, so host and client agree without extra configuration.
+SERVE_SCHEME_INSECURE = "https+insecure"
+SERVE_SCHEME_PLAIN = "http"
 # Hard caps: a peer that claims a giant frame/body/header must never make us
 # buffer unbounded memory (see ws_read, _request_once, read_http_headers).
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -737,33 +810,122 @@ def is_tailnet_name(host):
     return host.rstrip(".").lower().endswith(".ts.net")
 
 
-def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
-    """Return ``(connected_socket, connect_ms)``, trying direct then SOCKS5.
+def tls_context_for(host):
+    """Client TLS context for ``host``.
 
-    A tailnet IP or MagicDNS name that is only reachable in userspace (root-less)
-    mode has no direct route, so for those the SOCKS5 proxy is tried *first*;
-    otherwise a direct connection is preferred and SOCKS5 is the fallback. All
-    failure reasons are kept so the error explains which path was attempted.
+    A ``*.ts.net`` name is served by Tailscale's own publicly trusted
+    certificate, so it is verified normally (system CAs + hostname). This also
+    survives Tailscale's certificate rotation, which fingerprint pinning would
+    break. Anything else (a self-signed tower cert, or a bare IP) keeps peer
+    verification disabled here; those connections are pinned by the caller.
+    """
+    if is_tailnet_name(host):
+        return ssl.create_default_context()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _socket_kind_label(kind, forward):
+    return "direct" if forward is None else f"SOCKS5 {forward[0]}:{forward[1]}"
+
+
+def _connect_path(kind, forward, host, port, timeout):
+    """Open one connection path and return ``(keepalive_socket, connect_ms)``."""
+    started = time.monotonic()
+    if forward is None:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    else:
+        sock = _socks5_connect(forward, host, port, timeout)
+    return _enable_keepalive(sock), (time.monotonic() - started) * 1000.0
+
+
+# Which transport actually worked for a tailnet endpoint, so later connections
+# skip the race and go straight to the winner.
+_PATH_CACHE = {}
+_PATH_CACHE_LIMIT = 64
+
+
+def _remember_path(key, kind):
+    _PATH_CACHE[key] = kind
+    while len(_PATH_CACHE) > _PATH_CACHE_LIMIT:
+        _PATH_CACHE.pop(next(iter(_PATH_CACHE)))
+
+
+def _race_paths(attempts, host, port, timeout):
+    """Race several connection paths and return the first success.
+
+    Returns ``(sock|None, elapsed|None, kind|None, errors)``. A loser that
+    connects after the race is already decided closes its socket, so racing a
+    firewall-dropped direct route against a working SOCKS5 proxy never leaks a
+    descriptor or makes the caller wait for the slower path.
+    """
+    done = threading.Event()
+    lock = threading.Lock()
+    winner = {}
+    errors = []
+
+    def run(kind, forward):
+        try:
+            sock, elapsed = _connect_path(kind, forward, host, port, timeout)
+        except OSError as exc:
+            with lock:
+                errors.append(f"{_socket_kind_label(kind, forward)}: {exc}")
+            return
+        with lock:
+            if done.is_set():
+                sock.close()
+                return
+            done.set()
+            winner.update(sock=sock, elapsed=elapsed, kind=kind)
+
+    threads = [threading.Thread(target=run, args=item, daemon=True) for item in attempts]
+    for thread in threads:
+        thread.start()
+    done.wait(timeout + 0.5)
+    for thread in threads:
+        thread.join(timeout=0.5)
+    if not winner:
+        return None, None, None, errors
+    return winner["sock"], winner["elapsed"], winner["kind"], errors
+
+
+def open_socket(host, port, timeout=TOWER_PROBE_TIMEOUT):
+    """Return ``(connected_socket, connect_ms)``, trying direct and SOCKS5.
+
+    A tailnet IP or MagicDNS name may have a direct route (rootful Tailscale) or
+    only a SOCKS5 route (userspace/root-less). Both are raced in parallel, so the
+    working path wins immediately instead of the caller waiting out a full
+    timeout on the wrong one. Non-tailnet hosts try direct first and fall back
+    to SOCKS5, so ordinary traffic never detours through the proxy. All failure
+    reasons are kept so the error explains which path was attempted.
     """
     proxy = tailscale_proxy()
-    if proxy and (is_tailnet_address(host) or is_tailnet_name(host)):
-        attempts = [("SOCKS5", proxy), ("direct", None)]
-    else:
-        attempts = [("direct", None)] + ([("SOCKS5", proxy)] if proxy else [])
+    tailnet = is_tailnet_address(host) or is_tailnet_name(host)
     errors = []
-    for kind, forward in attempts:
+
+    if tailnet and proxy:
+        attempts = [("direct", None), ("SOCKS5", proxy)]
+        cached = _PATH_CACHE.get((host, port))
+        if cached is not None:
+            attempts.sort(key=lambda item: 0 if item[0] == cached else 1)
+            try:
+                return _connect_path(*attempts[0], host, port, timeout)
+            except OSError as exc:
+                errors.append(f"{_socket_kind_label(*attempts[0])}: {exc}")
+        sock, elapsed, kind, race_errors = _race_paths(attempts, host, port, timeout)
+        errors.extend(race_errors)
+        if sock is not None:
+            _remember_path((host, port), kind)
+            return sock, elapsed
+        raise OSError(f"cannot reach {host}:{port} ({'; '.join(errors)})")
+
+    for kind, forward in [("direct", None)] + ([("SOCKS5", proxy)] if proxy else []):
         try:
-            started = time.monotonic()
-            if forward is None:
-                sock = _enable_keepalive(socket.create_connection((host, port), timeout=timeout))
-            else:
-                sock = _enable_keepalive(_socks5_connect(forward, host, port, timeout))
-            return sock, (time.monotonic() - started) * 1000.0
+            return _connect_path(kind, forward, host, port, timeout)
         except OSError as exc:
-            if forward is None:
-                errors.append(f"direct: {exc}")
-            else:
-                errors.append(f"SOCKS5 {forward[0]}:{forward[1]}: {exc}")
+            errors.append(f"{_socket_kind_label(kind, forward)}: {exc}")
     if not proxy:
         errors.append("SOCKS5: no tailnet proxy detected")
     raise OSError(f"cannot reach {host}:{port} ({'; '.join(errors)})")
@@ -805,10 +967,8 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=Non
         conn = None
         try:
             if scheme == "https":
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout,
+                                                   context=tls_context_for(host))
             else:
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
             # Route through the tailnet SOCKS5 proxy when direct fails
@@ -855,22 +1015,44 @@ def probe_tower(host, port=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=Non
 
 
 def probe_tower_ports(host, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=None):
-    """Find the first port in ``ports`` where a tower answers.
+    """Find the first port in ``ports`` where a tower answers, probing in parallel.
 
     Returns ``(scheme, health, port)`` or ``None``. This is the pre-flight check
     the client runs before an upload: every candidate port is tested with the
     same health handshake, and a port occupied by another service (HTTP/TLS
-    reply) is skipped silently so the next one is tried. When nothing is found,
-    ``detail`` keeps the most informative reason (a port that answered wins over
-    a silent timeout) plus the port it came from.
+    reply) is skipped silently so the next one is tried. Probing is concurrent,
+    so a firewall that silently drops several ports costs one connect timeout
+    instead of one per port. When nothing is found, ``detail`` keeps the most
+    informative reason (a port that answered wins over a silent timeout) plus
+    the port it came from.
     """
     ports = normalize_ports(ports)
-    best = None
-    for port in ports:
+    results = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ports)))
+
+    def probe(port):
         per = {}
-        found = probe_tower(host, port, timeout, per)
-        if found:
-            return found[0], found[1], port
+        return port, probe_tower(host, port, timeout, per), per
+
+    try:
+        futures = [pool.submit(probe, port) for port in ports]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                port, found, per = future.result()
+            except Exception:
+                continue
+            results[port] = per
+            if found:
+                for other in futures:
+                    other.cancel()
+                return found[0], found[1], port
+    finally:
+        # Do not block on the losers: they carry at most one short probe timeout
+        # each and are cleaned up when they finish.
+        pool.shutdown(wait=False, cancel_futures=True)
+    best = None
+    for port in ports:  # keep the configured order for a deterministic reason
+        per = results.get(port) or {}
         error = per.get("error")
         if not error:
             continue
@@ -878,6 +1060,48 @@ def probe_tower_ports(host, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, det
         # that is the "another service occupies the port" case worth surfacing.
         if best is None or (port_answered(error) and not port_answered(best.get("error"))):
             best = {"error": error, "status": per.get("status"), "port": port}
+    if detail is not None and best:
+        detail.update(best)
+    return None
+
+
+def tower_hosts(*entries):
+    """Candidate hostnames for a tailnet peer (or plain host strings), deduped.
+
+    The tailnet IP comes first (fast, direct route on a rootful install); the
+    MagicDNS name is included because ``tailscale serve`` answers *only* on the
+    DNS name, never on the ``100.x.y.z`` IP. That mismatch is why a
+    firewall-free host used to look missing.
+    """
+    hosts = []
+    for entry in entries:
+        if not entry:
+            continue
+        values = (entry.get("ip"), entry.get("dns_name")) if isinstance(entry, dict) else (entry,)
+        for value in values:
+            value = (value or "").strip().rstrip(".")
+            if value and value not in hosts:
+                hosts.append(value)
+    return hosts
+
+
+def probe_tower_hosts(hosts, ports=DEFAULT_PORT, timeout=TOWER_PROBE_TIMEOUT, detail=None):
+    """Return ``(host, scheme, health, port)`` for the first host that answers.
+
+    Every candidate host is probed across all ports, so a serve/funnel host is
+    found on its MagicDNS name while a direct host is still found on its IP.
+    """
+    ports = normalize_ports(ports)
+    best = {}
+    for host in tower_hosts(*hosts):
+        per = {}
+        found = probe_tower_ports(host, ports, timeout, per)
+        if found:
+            return host, found[0], found[1], found[2]
+        if per.get("error") and (
+                not best.get("error")
+                or (port_answered(per["error"]) and not port_answered(best.get("error")))):
+            best = {**per, "host": host}
     if detail is not None and best:
         detail.update(best)
     return None
@@ -907,18 +1131,20 @@ def scan_tailnet_devices(ports=DEFAULT_PORT, status=None, timeout=TOWER_PROBE_TI
             entries.append({**peer, "self": False})
 
     def probe(entry):
-        host = entry["ip"] or entry["dns_name"]
+        hosts = tower_hosts(entry)
+        host = hosts[0] if hosts else None
         entry["latency"] = ping_latency(host, timeout) if host else None
         if entry["latency"] is None and host:
             # ICMP is unavailable (userspace mode, firewalled peer): fall
             # back to the TCP connect time through the direct/SOCKS5 path.
             entry["latency"] = connect_latency(host, ports[0], timeout)
         detail = {}
-        found = probe_tower_ports(host, ports, timeout, detail) if host else None
+        found = probe_tower_hosts(hosts, ports, timeout, detail) if hosts else None
         entry["tower"] = found is not None
         if found:
-            entry["scheme"], entry["health"], entry["probe_port"] = found
-            entry["url"] = f"{found[0]}://{host}:{found[2]}"
+            found_host, scheme, health, port = found
+            entry["scheme"], entry["health"], entry["probe_port"] = scheme, health, port
+            entry["url"] = f"{scheme}://{found_host}:{port}"
         else:
             entry["probe_port"] = detail.get("port") or ports[0]
             entry["probe_error"] = detail.get("error")
@@ -3451,15 +3677,19 @@ def serve(args):
     if tailnet and tailnet["state"] == "Running" and tailnet["self_ip"]:
         print(f"Reachable in the tailnet as {tailnet['self_ip']} "
               f"(use: --tower https://{tailnet['self_ip']}:{config.port})")
-    if os.name == "nt":
+    # Firewall-free path: tailscaled proxies the local host on the tailnet only
+    # (never public like Funnel), so no inbound port has to be opened. This is
+    # on by default; --no-tailscale-serve turns it off.
+    exposed = None
+    if tailscale_ready(tailnet) and not getattr(args, "no_tailscale_serve", False):
+        exposed = setup_tailscale_serve(config.port, configured_ports(args), tls=bool(context))
+    if exposed:
+        print(f"Tailnet-only, firewall-free URL: {exposed}")
+    if os.name == "nt" and not exposed:
         print("Windows Firewall drops inbound ports without a rule, so tailnet "
               "clients may see this host as unreachable. Allow the ports (admin "
               "PowerShell):")
         print("  " + windows_firewall_hint(ports))
-    if getattr(args, "tailscale_serve", False):
-        # Firewall-free alternative: tailscaled proxies the local host on the
-        # tailnet at https://<magicdns>:443, so no inbound port needs opening.
-        tailscale_serve(config.port)
     print("No authentication: anyone on the Tailscale network can submit jobs.")
     try:
         server.serve_forever()
@@ -3523,6 +3753,10 @@ class TowerClient:
         self.insecure = insecure
         self.confirm = confirm or self._confirm_fingerprint
         self.last_fingerprint = None
+        # A *.ts.net host (tailscale serve/funnel) presents Tailscale's own
+        # publicly trusted certificate, so it is verified normally instead of
+        # fingerprinted — pinning would break whenever Tailscale rotates it.
+        self.verify_tls = is_tailnet_name(self.host)
 
     def base(self):
         return f"{self.host}:{self.port}"
@@ -3541,6 +3775,10 @@ class TowerClient:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+        if self.verify_tls and not self.insecure:
+            # Validate the Tailscale-issued *.ts.net certificate properly
+            # instead of blindly accepting it.
+            return ssl.create_default_context()
         return context
 
     def _verify_peer(self, sock):
@@ -3552,14 +3790,21 @@ class TowerClient:
         digest = hashlib.sha256(der).hexdigest()
         self.last_fingerprint = digest
         expected = (os.environ.get("WIFI_HANDSHAKE_TOWER_FINGERPRINT", "")
-                    or self.fingerprint or known_fingerprint(self.host, self.port) or "").replace(":", "").lower()
-        if not expected:
-            if not self.confirm(digest):
-                raise RuntimeError("Host certificate not trusted.")
-            remember_fingerprint(self.host, self.port, digest)
+                    or self.fingerprint
+                    or ("" if self.verify_tls else known_fingerprint(self.host, self.port))
+                    or "").replace(":", "").lower()
+        if expected:
+            if digest.lower() != expected:
+                raise RuntimeError(f"Certificate fingerprint mismatch. Expected {expected}, got {digest}.")
             return
-        if digest.lower() != expected:
-            raise RuntimeError(f"Certificate fingerprint mismatch. Expected {expected}, got {digest}.")
+        if self.verify_tls:
+            # Already verified against the system CAs by _context(); a stored
+            # pin is deliberately ignored so certificate rotation cannot break
+            # the connection. Pass --fingerprint to pin a ts.net cert explicitly.
+            return
+        if not self.confirm(digest):
+            raise RuntimeError("Host certificate not trusted.")
+        remember_fingerprint(self.host, self.port, digest)
 
     def _socket_factory(self, address, connect_timeout=None, source_address=None, **kwargs):
         # http.client hook: connect through open_socket so the userspace
@@ -4535,6 +4780,105 @@ def self_test():
         kck = derive_ptk(pmk, line_ap, line_sta, anonce, eapol[17:49])[:16]
         assert hmac.new(kck, eapol, hashlib.sha1).digest()[:16] == line_mic
         print("Self-test: built-in pcap -> hc22000 converter verified on the example capture.")
+    # ------------------------------------------------------------------
+    # Tailscale serve (the firewall-free, tailnet-only path). The existing
+    # serve/funnel config must be parsed so an occupied port is skipped and
+    # nothing already configured is clobbered.
+    # ------------------------------------------------------------------
+    class _Completed:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+    _real_tailscale = globals()["_tailscale"]
+    _real_ts_serve = globals()["tailscale_serve"]
+    _real_ts_available = globals()["tailscale_available"]
+    try:
+        globals()["_tailscale"] = lambda *a, **k: _Completed(
+            "# Funnel on:\n#     - https://jannistower.tailfcf2d7.ts.net:8443\n"
+            "https://jannistower.tailfcf2d7.ts.net (Funnel on)\n"
+            "|-- / proxy http://127.0.0.1:5173\n")
+        used = tailscale_serve_status()["ports"]
+        assert used == {443, 8443}, used
+        globals()["tailscale_available"] = lambda: True
+        calls = []
+        globals()["tailscale_serve"] = lambda port, serve_port=None, tls=True, timeout=60: (
+            calls.append((port, serve_port, tls)) or f"https://x.ts.net:{serve_port}")
+        url = setup_tailscale_serve(8443, [8443, 9443, 10443], tls=False)
+        assert url == "https://x.ts.net:9443", url
+        assert calls == [(8443, 9443, False)], calls
+        # Tailscale's Funnel ingress proxies (tag:ingress) must never show up as
+        # devices; they are infrastructure, not peers.
+        globals()["_tailscale"] = lambda *a, **k: _Completed(json.dumps({
+            "BackendState": "Running",
+            "Self": {"HostName": "tower", "DNSName": "tower.tail.ts.net.",
+                     "TailscaleIPs": ["100.1.2.3"]},
+            "Peer": {
+                "ingress": {"HostName": "funnel-ingress-node", "Tags": ["tag:ingress"],
+                            "TailscaleIPs": ["fd7a::1"], "Online": True},
+                "laptop": {"HostName": "laptop", "DNSName": "laptop.tail.ts.net.",
+                           "TailscaleIPs": ["100.9.9.9"], "OS": "linux", "Online": True},
+            },
+        }))
+        parsed_status = tailscale_status()
+        assert [p["hostname"] for p in parsed_status["peers"]] == ["laptop"], parsed_status["peers"]
+        assert parsed_status["self_ip"] == "100.1.2.3"
+    finally:
+        globals()["_tailscale"] = _real_tailscale
+        globals()["tailscale_serve"] = _real_ts_serve
+        globals()["tailscale_available"] = _real_ts_available
+    # *.ts.net is verified against the system CAs (cert rotation safe); a bare
+    # IP or self-signed host keeps fingerprint pinning.
+    assert tls_context_for("jannistower.tailfcf2d7.ts.net").verify_mode == ssl.CERT_REQUIRED
+    assert tls_context_for("jannistower.tailfcf2d7.ts.net").check_hostname is True
+    assert tls_context_for("100.105.183.20").verify_mode == ssl.CERT_NONE
+    assert TowerClient("https://jannistower.tailfcf2d7.ts.net:443").verify_tls is True
+    assert TowerClient("https://100.105.183.20:8443").verify_tls is False
+    # A peer yields both the tailnet IP and the MagicDNS name, IP first; the DNS
+    # name is what makes a serve/funnel host discoverable at all.
+    assert tower_hosts({"ip": "100.1.2.3", "dns_name": "tower.tail.ts.net."}) == \
+        ["100.1.2.3", "tower.tail.ts.net"]
+    assert tower_hosts({"ip": "", "dns_name": "tower.tail.ts.net"}) == ["tower.tail.ts.net"]
+    assert tower_hosts("100.1.2.3", "100.1.2.3") == ["100.1.2.3"]
+    # ------------------------------------------------------------------
+    # A real second process: start the host through the CLI and talk to it with
+    # the real client. This covers argparse -> serve() -> HTTP wiring end to
+    # end, which in-process fakes cannot.
+    # ------------------------------------------------------------------
+    _port_probe = socket.socket()
+    _port_probe.bind(("127.0.0.1", 0))
+    _cli_port = _port_probe.getsockname()[1]
+    _port_probe.close()
+    with tempfile.TemporaryDirectory(prefix="tower-cli-") as tmp:
+        host_proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--serve",
+             "--bind", "127.0.0.1", "--port", str(_cli_port), "--no-tls",
+             "--no-tailscale-serve", "--jobs-dir", str(Path(tmp) / "jobs"),
+             "--wordlist-dirs", str(Path(tmp) / "wl")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ready, deadline = False, time.monotonic() + 60
+            while time.monotonic() < deadline and host_proc.poll() is None:
+                if probe_tower("127.0.0.1", _cli_port, timeout=0.5):
+                    ready = True
+                    break
+                time.sleep(0.3)
+            assert ready, f"host CLI process did not answer on 127.0.0.1:{_cli_port}"
+            cli_client = TowerClient(f"http://127.0.0.1:{_cli_port}", insecure=True, timeout=15)
+            assert cli_client.health().get("ok") is True
+            upload = Path(tmp) / "cap.pcapng"
+            upload.write_bytes(b"\x0a\x0d\x0d\x0a" + bytes(60))
+            created = cli_client.create_job(upload, {"type": "mask", "mask": "?d"})
+            job_id = created.get("job_id")
+            assert job_id, created
+            assert cli_client.job(job_id)["id"] == job_id
+            print("Self-test: real CLI host process accepted health + a job upload.")
+        finally:
+            host_proc.terminate()
+            try:
+                host_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                host_proc.kill()
+                host_proc.wait(timeout=10)
     if not shutil.which("tshark"):
         print("Self-test passed (pure logic, tower protocol, attack building). "
               "tshark not found; skipping the offline packet test.")
@@ -4801,11 +5145,12 @@ def menu_tailscale_serve(args):
     ports = configured_ports(args)
     heading("Expose host via Tailscale serve")
     info("Run this on the machine that runs --serve (the GPU box).")
-    info("tailscaled proxies the local HTTPS host to https://<magicdns>:443, so "
-         "the OS firewall never has to allow an inbound port.")
+    info("tailscaled proxies the local host to https://<magicdns>:<port>, so the OS "
+         "firewall never has to allow an inbound port. This stays inside the "
+         "tailnet only; Funnel (public internet) is never used.")
     answer = input(f"Local host port to expose [{ports[0]}]: ").strip()
     port = int(answer) if answer.isdecimal() and 0 < int(answer) < 65536 else ports[0]
-    if tailscale_serve(port):
+    if setup_tailscale_serve(port, ports):
         print("Stop sharing with: python wifi-handshake.py --tailscale-serve-reset")
 
 
@@ -5056,7 +5401,10 @@ Only test networks you own or have permission to test.
                            help="list all reachable tailnet devices, then exit")
     tailscale.add_argument("--tailscale-serve", action="store_true",
                            help="expose the local host on the tailnet via `tailscale "
-                                "serve` (firewall-free: https://<magicdns>:443)")
+                                "serve` (firewall-free, tailnet-only; already on by "
+                                "default with --serve)")
+    tailscale.add_argument("--no-tailscale-serve", action="store_true",
+                           help="do not configure `tailscale serve` automatically")
     tailscale.add_argument("--tailscale-serve-reset", action="store_true",
                            help="remove all `tailscale serve` configuration, then exit")
     return parser
@@ -5281,7 +5629,8 @@ def main(argv=None):
             return 0 if tailscale_serve_reset() else 1
         if args.tailscale_serve and not args.serve:
             # Standalone: expose an already-running host (pass --port for its port).
-            url = tailscale_serve(configured_ports(args)[0])
+            ports = configured_ports(args)
+            url = setup_tailscale_serve(ports[0], ports)
             return 0 if url else 1
         if args.discover_towers:
             if not tailscale_ready():
